@@ -27,7 +27,7 @@
 #include <stdatomic.h>                            /* PIPE: ready-flags / job queue */
 #include <sched.h>                                /* PIPE: sched_yield nello spin */
 #include <unistd.h>
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif

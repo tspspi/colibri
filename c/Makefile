@@ -82,8 +82,10 @@ endif
 
 all: glm$(EXE)
 
+ifneq ($(EXE),)
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
+endif
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
@@ -137,4 +139,4 @@ clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all cuda-test portable test-c test-python test check clean
