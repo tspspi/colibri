@@ -146,6 +146,112 @@ typedef struct {
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
+static float *falloc(int64_t n);
+static int g_albate_layer=-1;
+static float *g_albate_dir=NULL;
+static float g_albate_scale=1.f;
+static char g_albate_collect_path[2048]="";
+static int g_albate_collect_pending=0;
+static int g_albate_collect_broken=0;
+#define ALBATE_MAGIC "ALBTV1\0\0"
+static void albate_collect_arm(void){
+    if(g_albate_collect_path[0] && g_albate_layer>=0) g_albate_collect_pending=1;
+}
+static void albate_collect_sample(const float *row, int D, int layer){
+    if(!g_albate_collect_pending || !g_albate_collect_path[0] || g_albate_collect_broken) return;
+    FILE *f=fopen(g_albate_collect_path,"ab+");
+    if(!f){
+        perror(g_albate_collect_path);
+        g_albate_collect_broken=1;
+        g_albate_collect_pending=0;
+        return;
+    }
+    char mg[8]={0};
+    rewind(f);
+    size_t nr=fread(mg,1,8,f);
+    if(nr==0){
+        if(fwrite(ALBATE_MAGIC,1,8,f)!=8){
+            perror("[ALBATE] write magic");
+            fclose(f);
+            g_albate_collect_broken=1;
+            g_albate_collect_pending=0;
+            return;
+        }
+    } else if(nr!=8 || memcmp(mg,ALBATE_MAGIC,8)){
+        fprintf(stderr,"[ALBATE] %s has an invalid sample header\n", g_albate_collect_path);
+        fclose(f);
+        g_albate_collect_broken=1;
+        g_albate_collect_pending=0;
+        return;
+    }
+    fseek(f,0,SEEK_END);
+    int32_t meta[2]={layer,D};
+    if(fwrite(meta,4,2,f)!=2 || fwrite(row,4,D,f)!=(size_t)D){
+        perror("[ALBATE] append sample");
+        g_albate_collect_broken=1;
+    }
+    fclose(f);
+    g_albate_collect_pending=0;
+}
+static void albate_apply(float *x, int S, int D){
+    if(!g_albate_dir) return;
+    for(int s=0;s<S;s++){
+        float *row=x+(int64_t)s*D;
+        double dot=0;
+        for(int i=0;i<D;i++) dot+=(double)row[i]*g_albate_dir[i];
+        float proj=(float)(dot*g_albate_scale);
+        for(int i=0;i<D;i++) row[i]-=proj*g_albate_dir[i];
+    }
+}
+static int albate_init(Model *m){
+    const char *layer_s=getenv("COLI_ALBATE_LAYER");
+    const char *dir_s=getenv("COLI_ALBATE_DIR");
+    const char *collect_s=getenv("COLI_ALBATE_COLLECT");
+    if(layer_s) g_albate_layer=atoi(layer_s);
+    if(getenv("COLI_ALBATE_SCALE")) g_albate_scale=(float)atof(getenv("COLI_ALBATE_SCALE"));
+    if(dir_s && *dir_s && g_albate_layer<0){
+        fprintf(stderr,"COLI_ALBATE_DIR requires COLI_ALBATE_LAYER\n");
+        return 0;
+    }
+    if(collect_s && *collect_s && g_albate_layer<0){
+        fprintf(stderr,"COLI_ALBATE_COLLECT requires COLI_ALBATE_LAYER\n");
+        return 0;
+    }
+    if(g_albate_layer>=m->c.n_layers + (m->has_mtp?1:0)){
+        fprintf(stderr,"COLI_ALBATE_LAYER=%d is outside the valid range [0,%d]\n",
+            g_albate_layer, m->c.n_layers + (m->has_mtp?1:0) - 1);
+        return 0;
+    }
+    if(collect_s && *collect_s){
+        snprintf(g_albate_collect_path,sizeof(g_albate_collect_path),"%s",collect_s);
+        fprintf(stderr,"[ALBATE] collecting layer %d samples into %s\n", g_albate_layer, g_albate_collect_path);
+    }
+    if(dir_s && *dir_s){
+        FILE *f=fopen(dir_s,"rb");
+        if(!f){ perror(dir_s); return 0; }
+        int D=m->c.hidden;
+        g_albate_dir=falloc(D);
+        if(fread(g_albate_dir,4,D,f)!=(size_t)D){
+            fprintf(stderr,"[ALBATE] expected %d float32 values in %s\n", D, dir_s);
+            fclose(f);
+            free(g_albate_dir);
+            g_albate_dir=NULL;
+            return 0;
+        }
+        float extra;
+        if(fread(&extra,4,1,f)==1){
+            fprintf(stderr,"[ALBATE] %s is larger than one hidden-state vector\n", dir_s);
+            fclose(f);
+            free(g_albate_dir);
+            g_albate_dir=NULL;
+            return 0;
+        }
+        fclose(f);
+        fprintf(stderr,"[ALBATE] active on layer %d (scale=%.3f) from %s\n",
+            g_albate_layer, g_albate_scale, dir_s);
+    }
+    return 1;
+}
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -1488,6 +1594,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
+    if(li==g_albate_layer){
+        if(g_albate_collect_pending && S>0) albate_collect_sample(x+(int64_t)(S-1)*D, D, li);
+        albate_apply(x,S,D);
+    }
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
@@ -1856,6 +1966,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    albate_collect_arm();
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
     for(int s=0;s<S;s++){
@@ -1964,6 +2075,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double t=now_s();
+    albate_collect_arm();
     float *logit=step(m,pids,np,0);
     EmitStream es={&T,m,t,0,0};
     grammar_reset();
@@ -2279,7 +2391,7 @@ static void run_serve(Model *m, const char *snap){
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){ albate_collect_arm(); logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
@@ -2695,6 +2807,7 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    if(!albate_init(&m)) return 2;
     if(g_draft<0) g_draft = m.has_mtp ? 3 : 0;
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
