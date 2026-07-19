@@ -6381,7 +6381,7 @@ int main(int argc, char **argv){
 #endif
 #ifdef __FreeBSD__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
-        execv("/proc/curproc/file", argv);         /* returns only on failure -> fall through and run untuned */
+        execvp(argv[0], argv);                     /* /proc may be absent; PATH/relative argv still work */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
