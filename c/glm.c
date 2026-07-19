@@ -74,12 +74,20 @@ static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a mat
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
 static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
 #endif
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__AVXVNNI__) || defined(__AVX512F__) || defined(__AVX512BW__) || defined(__AVX512VNNI__)
 #include <immintrin.h>
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
 static inline float hsum256(__m256 v){            /* somma orizzontale di 8 float */
     __m128 lo=_mm256_castps256_ps128(v), hi=_mm256_extractf128_ps(v,1);
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
+}
+#elif defined(__SSSE3__)
+#include <tmmintrin.h>
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
 }
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>                             /* Apple Silicon / aarch64: kernel NEON */
@@ -711,6 +719,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
+#elif defined(__SSSE3__)
+#define IDOT_KERNEL "ssse3"
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
 #define IDOT_KERNEL "neon-i8mm"
 #elif defined(__ARM_NEON)
@@ -745,12 +755,6 @@ static inline int hsum256_i32(__m256i v){
     __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
     lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
     return _mm_cvtsi128_si32(lo);
-}
-#endif
-#if defined(__AVXVNNI__) && defined(__AVX2__)
-/* hsum di un __m128i a 4 lane s32 (l'AVX-VNNI 128-bit accumula su 4 lane). */
-static inline int hsum128_i32(__m128i v){
-    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
 }
 #endif
 /* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
@@ -792,6 +796,15 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    __m128i acc=_mm_setzero_si128(); const __m128i ones=_mm_set1_epi16(1);
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
      * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
@@ -896,6 +909,18 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8), ones=_mm_set1_epi16(1);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w4+(i>>1)));   /* 8 byte = 16 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i wv=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);      /* nibble in ordine */
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
 #if defined(__ARM_FEATURE_DOTPROD)
