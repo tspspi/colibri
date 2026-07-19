@@ -140,6 +140,17 @@ def memory_available():
                 return int(total)
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
+    # FreeBSD: no /proc/meminfo and no stable MemAvailable equivalent. On ZFS hosts a
+    # large reclaimable ARC can sit outside the obvious VM free/inactive counters, so
+    # installed RAM is a better auto-tier fallback than collapsing to 0/8 GB.
+    if sys.platform.startswith("freebsd"):
+        try:
+            total = subprocess.run(["sysctl", "-n", "hw.physmem"], text=True,
+                                   capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
     return 0
 
 

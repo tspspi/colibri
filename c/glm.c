@@ -38,6 +38,9 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>                           /* hw.physmem: fallback RAM autodetect on FreeBSD */
+#endif
 #ifdef __linux__
 #include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
 #endif
@@ -5779,6 +5782,11 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
     *ram_total=*ram_avail=0;
 #ifdef _WIN32
     compat_meminfo(ram_total,ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
+#elif defined(__FreeBSD__)
+    { unsigned long long phys=0; size_t n=sizeof(phys);
+      if(sysctlbyname("hw.physmem",&phys,&n,NULL,0)==0 && phys){
+          *ram_total=(double)phys/1e9;
+          *ram_avail=(double)phys/1e9; } }
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;
@@ -6140,8 +6148,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
  * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
- * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
+ * (stessa semantica: recuperabili senza swap). FreeBSD non espone un equivalente
+ * stabile a MemAvailable e con ZFS la memoria davvero recuperabile puo' vivere
+ * nell'ARC fuori dai contatori VM piu' ovvi; usare hw.physmem come fallback e'
+ * molto meglio del vecchio "assumo 8 GB", che castrava la cache expert su host
+ * con parecchia RAM. */
 static double mem_available_gb(void){
 #ifdef __APPLE__
     mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
@@ -6149,6 +6160,10 @@ static double mem_available_gb(void){
     if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vm,&cnt)!=KERN_SUCCESS) return 0;
     return ((double)vm.free_count+(double)vm.inactive_count+(double)vm.purgeable_count)
            * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(__FreeBSD__)
+    unsigned long long phys=0; size_t n=sizeof(phys);
+    if(sysctlbyname("hw.physmem",&phys,&n,NULL,0)==0 && phys) return (double)phys / 1e9;
+    return 0;
 #elif defined(_WIN32)
     double total, avail;
     compat_meminfo(&total, &avail);
