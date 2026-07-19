@@ -21,6 +21,30 @@ static int32_t ref_i4i8(const uint8_t *w4, const int8_t *x, int I){
     for(int i=0;i<I;i++){ uint8_t b=w4[i>>1]; int v=(i&1)?((int)(b>>4)-8):((int)(b&0xF)-8); s+=v*x[i]; }
     return (int32_t)s;
 }
+static float ref_qrow_i8(const float *x, int8_t *q, int I){
+    float amax=0;
+    for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax) amax=a; }
+    float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
+    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
+    return s;
+}
+static int check_qrow(int I){
+    float *x=malloc((size_t)I*sizeof(float));
+    int8_t *q=malloc((size_t)I), *qref=malloc((size_t)I);
+    for(int i=0;i<I;i++) x[i]=((float)((int)(xr()%16385)-8192))/64.f;
+    if(I>0) x[0]=0.5f;
+    if(I>1) x[1]=-0.5f;
+    if(I>2) x[2]=126.5f/127.f;
+    if(I>3) x[3]=-126.5f/127.f;
+    float s=qrow_i8(x,q,I), sref=ref_qrow_i8(x,qref,I);
+    int rc=0;
+    if(memcmp(&s,&sref,sizeof(float))!=0 || memcmp(q,qref,(size_t)I)!=0){
+        fprintf(stderr,"FAIL qrow_i8 I=%d: scale %.9g != %.9g\n",I,(double)s,(double)sref);
+        rc=1;
+    }
+    free(x); free(q); free(qref);
+    return rc;
+}
 
 /* Driver-level exactness: matmul_qt_ex on the IDOT path (allow_idot=1) must match
  * a plain-C reference bit-for-bit. This exercises the SMMLA 2x2-tile drivers on the
@@ -69,6 +93,10 @@ static int check_driver(int fmt,int O,int I,int S){
 int main(void){
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
     static int8_t w[8192], x[8192]; static uint8_t w4[4096];
+    for(unsigned t=0;t<sizeof(sizes)/sizeof(sizes[0]);t++)
+        for(int rep=0;rep<32;rep++)
+            if(check_qrow(sizes[t])) return 1;
+    printf("qrow_i8 exactness: ok\n");
     for(unsigned t=0;t<sizeof(sizes)/sizeof(sizes[0]);t++){
         int I=sizes[t];
         for(int rep=0;rep<64;rep++){

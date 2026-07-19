@@ -746,9 +746,34 @@ static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 del
                        * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
 #endif
 static inline float qrow_i8(const float *x, int8_t *q, int I){
-    float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
+    float amax=0;
+    int i=0;
+#if defined(__AVX2__) || defined(__AVXVNNI__) || defined(__AVX512F__) || defined(__AVX512BW__) || defined(__AVX512VNNI__) || defined(__SSSE3__)
+    const __m128 sign=_mm_set1_ps(-0.0f);
+    __m128 vmax=_mm_setzero_ps();
+    for(;i+4<=I;i+=4){
+        __m128 xv=_mm_loadu_ps(x+i);
+        vmax=_mm_max_ps(vmax,_mm_andnot_ps(sign,xv));
+    }
+    float mt[4];
+    _mm_storeu_ps(mt,vmax);
+    for(int k=0;k<4;k++) if(mt[k]>amax) amax=mt[k];
+#endif
+    for(;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
-    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
+    i=0;
+#if defined(__AVX2__) || defined(__AVXVNNI__) || defined(__AVX512F__) || defined(__AVX512BW__) || defined(__AVX512VNNI__) || defined(__SSSE3__)
+    __m128 vinv=_mm_set1_ps(inv);
+    for(;i+4<=I;i+=4){
+        __m128 xv=_mm_mul_ps(_mm_loadu_ps(x+i),vinv);
+        __m128i qi32=_mm_cvtps_epi32(xv);
+        __m128i qi16=_mm_packs_epi32(qi32,qi32);
+        __m128i qi8=_mm_packs_epi16(qi16,qi16);
+        int v=_mm_cvtsi128_si32(qi8);
+        memcpy(q+i,&v,4);
+    }
+#endif
+    for(;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
     return s;
 }
 #ifdef __AVX2__
