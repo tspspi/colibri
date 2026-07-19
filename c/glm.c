@@ -40,6 +40,7 @@
 #endif
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>                           /* hw.physmem: fallback RAM autodetect on FreeBSD */
+#include <sys/domainset.h>                        /* COLI_NUMA: per-thread domain policy during slab first-touch */
 #endif
 #ifdef __linux__
 #include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
@@ -1347,12 +1348,11 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * slabs recruits all memory controllers: +7%/-14% expert-matmul on 2 sockets,
  * +40% on a 4-socket (#82). Blanket `numactl --interleave=all` is NOT equivalent:
  * it also interleaves the CUDA pinned staging buffers and cost a 4-socket GPU host
- * 10x (#82) — hence per-region mbind here and nothing else. Raw syscall, no libnuma
- * dependency; MPOL_MF_MOVE migrates pages of reused heap chunks too. Linux-only,
- * silent no-op elsewhere or on single-node hosts. */
-#ifdef __linux__
-static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
-#endif
+ * 10x (#82) — hence per-region mbind here and nothing else. Linux uses raw
+ * mbind; FreeBSD has no per-region mbind equivalent, so COLI_NUMA=1 temporarily
+ * switches the allocating thread to DOMAINSET_POLICY_INTERLEAVE and first-touches
+ * the large slabs page-by-page. Silent no-op on single-node hosts. */
+static int g_numa_nodes=0;
 static void numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
     if(g_numa_nodes<2 || !p || !n) return;
@@ -1361,6 +1361,18 @@ static void numa_slab_bind(void *p, size_t n){
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
     syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
             (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
+#elif defined(__FreeBSD__)
+    if(g_numa_nodes<2 || !p || !n) return;
+    domainset_t oldmask, mask;
+    int oldpolicy=DOMAINSET_POLICY_INVALID;
+    if(cpuset_getdomain(CPU_LEVEL_WHICH,CPU_WHICH_TID,-1,sizeof(oldmask),&oldmask,&oldpolicy)!=0) return;
+    DOMAINSET_ZERO(&mask);
+    for(int i=0;i<g_numa_nodes;i++) DOMAINSET_SET(i,&mask);
+    if(cpuset_setdomain(CPU_LEVEL_WHICH,CPU_WHICH_TID,-1,sizeof(mask),&mask,DOMAINSET_POLICY_INTERLEAVE)!=0) return;
+    volatile char *q=(volatile char*)p;
+    for(size_t off=0; off<n; off+=4096) q[off]=0;
+    if(n) q[n-1]=0;
+    cpuset_setdomain(CPU_LEVEL_WHICH,CPU_WHICH_TID,-1,sizeof(oldmask),&oldmask,oldpolicy);
 #else
     (void)p;(void)n;
 #endif
@@ -1372,6 +1384,15 @@ static void numa_init(void){
         struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
     if(g_numa_nodes>=2) fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
     else fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n");
+#elif defined(__FreeBSD__)
+    if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
+    size_t n=sizeof(g_numa_nodes);
+    if(sysctlbyname("vm.ndomains",&g_numa_nodes,&n,NULL,0)!=0 || g_numa_nodes<2){
+        g_numa_nodes=0;
+        fprintf(stderr,"[NUMA] single domain: COLI_NUMA ignored\n");
+        return;
+    }
+    fprintf(stderr,"[NUMA] large slabs first-touched with interleave policy across %d domains\n",g_numa_nodes);
 #endif
 }
 
