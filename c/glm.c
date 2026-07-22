@@ -670,6 +670,7 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
 static void matmul_qt(float *y,const float *x,QT *w,int S);
 static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
 static int g_idot=1;
+static int g_no_i8_small_reuse=0; /* COLI_NO_I8_SMALL_REUSE=1: A/B small-nr int8 gate/up qrow reuse */
 static inline float sigmoidf(float x);
 static inline float qrow_i8(const float *x, int8_t *q, int I);
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
@@ -697,6 +698,16 @@ static int g_spec_live=0;                    /* set by spec_decode while drafts 
 static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+    if(!g_no_i8_small_reuse && g_idot && S>=1 && S<=3 &&
+       wg->fmt==1 && wu->fmt==1 && wg->I==wu->I && wg->O==wu->O){
+        int I=wg->I; int8_t *xq; float *sx;
+        if((size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"expert_gate_up: shape overflow\n"); exit(1); }
+        quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        matmul_q_idot(g,xq,sx,wg->q8,wg->s,S,I,wg->O);
+        matmul_q_idot(u,xq,sx,wu->q8,wu->s,S,I,wu->O);
+        return;
+    }
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
@@ -6668,6 +6679,7 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_no_i4_exact_sse = getenv("COLI_NO_I4_EXACT_SSE")?atoi(getenv("COLI_NO_I4_EXACT_SSE")):0;
+    g_no_i8_small_reuse = getenv("COLI_NO_I8_SMALL_REUSE")?atoi(getenv("COLI_NO_I8_SMALL_REUSE")):0;
     g_no_rmsnorm_simd = getenv("COLI_NO_RMSNORM_SIMD")?atoi(getenv("COLI_NO_RMSNORM_SIMD")):0;
     g_no_rope_inv_cache = getenv("COLI_NO_ROPE_INV_CACHE")?atoi(getenv("COLI_NO_ROPE_INV_CACHE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;

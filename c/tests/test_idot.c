@@ -236,6 +236,36 @@ static int check_rmsnorm_exact(int D, float eps){
     return 0;
 }
 
+static int check_expert_gate_up_small_i8_exact(int O,int I,int S){
+    QT wg={0}, wu={0};
+    fill_qt(&wg,1,O,I);
+    fill_qt(&wu,1,O,I);
+    float *x=malloc((size_t)S*I*sizeof(float));
+    float *g0=malloc((size_t)S*O*sizeof(float));
+    float *u0=malloc((size_t)S*O*sizeof(float));
+    float *g1=malloc((size_t)S*O*sizeof(float));
+    float *u1=malloc((size_t)S*O*sizeof(float));
+    for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=((float)(xr()%4001)-2000.f)/500.f;
+    g_no_i8_small_reuse=0;
+    expert_gate_up(g0,u0,x,&wg,&wu,S);
+    g_no_i8_small_reuse=1;
+    expert_gate_up(g1,u1,x,&wg,&wu,S);
+    for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&g0[i],&g1[i],sizeof(float))!=0){
+        fprintf(stderr,"FAIL expert_gate_up small-i8 gate O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
+                O,I,S,(long long)i,(double)g0[i],(double)g1[i]);
+        free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
+        return 1;
+    }
+    for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&u0[i],&u1[i],sizeof(float))!=0){
+        fprintf(stderr,"FAIL expert_gate_up small-i8 up O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
+                O,I,S,(long long)i,(double)u0[i],(double)u1[i]);
+        free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
+        return 1;
+    }
+    free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
+    return 0;
+}
+
 int main(void){
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
     static int8_t w[8192], x[8192]; static uint8_t w4[4096];
@@ -307,6 +337,16 @@ int main(void){
       for(unsigned b=0;b<sizeof rms_epss/sizeof rms_epss[0];b++)
        if(check_rmsnorm_exact(rms_Ds[a],rms_epss[b])) return 1;
     printf("rmsnorm exactness: ok\n");
+
+    static const int eg_Os[]={1,2,3,64};
+    static const int eg_Is[]={16,17,100,1408};
+    static const int eg_Ss[]={1,2,3};
+    for(int rep=0;rep<4;rep++)
+     for(unsigned a=0;a<sizeof eg_Os/sizeof eg_Os[0];a++)
+      for(unsigned b=0;b<sizeof eg_Is/sizeof eg_Is[0];b++)
+       for(unsigned c=0;c<sizeof eg_Ss/sizeof eg_Ss[0];c++)
+        if(check_expert_gate_up_small_i8_exact(eg_Os[a],eg_Is[b],eg_Ss[c])) return 1;
+    printf("expert gate/up small-i8 exactness: ok\n");
 
     return 0;
 }
