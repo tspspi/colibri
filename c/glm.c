@@ -86,6 +86,11 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
 }
 #elif defined(__SSSE3__)
+#elif defined(__SSE4_1__)
+#include <smmintrin.h>
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
 #include <tmmintrin.h>
 static inline int hsum128_i32(__m128i v){
     v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
@@ -518,6 +523,7 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 }
 /* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
 static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
+static int g_no_i4_exact_sse=0; /* COLI_NO_I4_EXACT_SSE=1: A/B x86 SSE4.1 exact int4 GEMM path */
     int rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
@@ -538,6 +544,21 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
 #elif defined(__ARM_NEON)
+#elif defined(__SSE4_1__)
+            if(!g_no_i4_exact_sse){
+                const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
+                float tmp[16];
+                for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);
+                    __m128 p0=_mm_mul_ps(_mm_loadu_ps(xs+i),   _mm_cvtepi32_ps(_mm_cvtepi8_epi32(nib)));
+                    __m128 p1=_mm_mul_ps(_mm_loadu_ps(xs+i+4), _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(nib,4))));
+                    __m128 p2=_mm_mul_ps(_mm_loadu_ps(xs+i+8), _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(nib,8))));
+                    __m128 p3=_mm_mul_ps(_mm_loadu_ps(xs+i+12),_mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(nib,12))));
+                    _mm_storeu_ps(tmp,p0); _mm_storeu_ps(tmp+4,p1); _mm_storeu_ps(tmp+8,p2); _mm_storeu_ps(tmp+12,p3);
+                    for(int k=0;k<16;k+=2) a+=tmp[k]+tmp[k+1];
+                }
+            }
             const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
             for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 byte=16 nibble */
@@ -648,10 +669,17 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
 
 static void matmul_qt(float *y,const float *x,QT *w,int S);
 static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
+static int g_idot=1;
+static inline float sigmoidf(float x);
+static inline float qrow_i8(const float *x, int8_t *q, int I);
+static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                          const float *scale, int S, int I, int O);
+static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx);
  * that changes OMP scheduling vs separate matmul_qt calls — this
  * shifts floating-point accumulation order and can collapse MTP
  * draft acceptance by flipping near-ties (#163). */
 /* #163: l'acceptance MTP crolla quando il forward di draft (S=1) e quello di verifica
+static int g_no_rmsnorm_simd=0; /* COLI_NO_RMSNORM_SIMD=1: A/B x86 SIMD output pass for rmsnorm */
  * (S>=2) non calcolano la STESSA funzione. Tre interruttori dipendono da S: il gate
  * int4-IDOT (S>=g_i4s — asimmetrico proprio dove g_i4s>1), la fusione gate+up solo-S==1,
  * e la soglia righe del GEMM Metal. Con SPEC_PIN=1 (default) ogni forward emesso mentre
@@ -731,7 +759,6 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #else
 #define IDOT_KERNEL "scalar"
 #endif
-static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
                        * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
@@ -1471,7 +1498,26 @@ static void qt_fill(QT *t, const float *w, int bits){
 
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
-    float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
+    float r=1.f/sqrtf((float)(ms/D)+eps);
+#if defined(__SSE4_1__)
+    if(!g_no_rmsnorm_simd){
+        __m128 rr=_mm_set1_ps(r);
+        int i=0;
+        for(;i+16<=D;i+=16){
+            __m128 x0=_mm_loadu_ps(x+i),    w0=_mm_loadu_ps(w+i);
+            __m128 x1=_mm_loadu_ps(x+i+4),  w1=_mm_loadu_ps(w+i+4);
+            __m128 x2=_mm_loadu_ps(x+i+8),  w2=_mm_loadu_ps(w+i+8);
+            __m128 x3=_mm_loadu_ps(x+i+12), w3=_mm_loadu_ps(w+i+12);
+            _mm_storeu_ps(out+i,   _mm_mul_ps(_mm_mul_ps(x0,rr),w0));
+            _mm_storeu_ps(out+i+4, _mm_mul_ps(_mm_mul_ps(x1,rr),w1));
+            _mm_storeu_ps(out+i+8, _mm_mul_ps(_mm_mul_ps(x2,rr),w2));
+            _mm_storeu_ps(out+i+12,_mm_mul_ps(_mm_mul_ps(x3,rr),w3));
+        }
+        for(;i<D;i++) out[i]=x[i]*r*w[i];
+        return;
+    }
+#endif
+    for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 /* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
@@ -1486,20 +1532,30 @@ static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
+static int g_no_rope_inv_cache=0;   /* COLI_NO_ROPE_INV_CACHE=1: A/B the per-qk/theta inverse-frequency cache */
 static void rope_interleave(float *v, int pos, const Cfg *c){
     int half = c->qk_rope/2;
     /* Validate against the fixed buffers (in[256], cache cs/sn[128] -> qk_rope<=256).
      * Abort cleanly instead of smashing the stack. (GLM-5.2 qk_rope=64.) (#183) */
     if(c->qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope_interleave buffer (256)\n",c->qk_rope); exit(1); }
-    typedef struct { int pos,qk,valid; float theta,cs[128],sn[128]; } RopeCache;   /* (#80) */
+    typedef struct {
+        int pos,qk,trig_valid,inv_valid;
+        float theta,inv[128],cs[128],sn[128];
+    } RopeCache;   /* (#80) */
     static _Thread_local RopeCache cache;
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
-    if(!cache.valid||cache.pos!=pos||cache.qk!=c->qk_rope||cache.theta!=c->theta){
+    if(!g_no_rope_inv_cache &&
+       (!cache.inv_valid || cache.qk!=c->qk_rope || cache.theta!=c->theta)){
+        for(int j=0;j<half;j++) cache.inv[j]=powf(c->theta,-2.0f*j/c->qk_rope);
+        cache.qk=c->qk_rope; cache.theta=c->theta; cache.inv_valid=1; cache.trig_valid=0;
+    }
+    if(!cache.trig_valid || cache.pos!=pos || cache.qk!=c->qk_rope || cache.theta!=c->theta){
         for(int j=0;j<half;j++){
-            float inv=powf(c->theta,-2.0f*j/c->qk_rope),ang=pos*inv;
+            float inv=g_no_rope_inv_cache ? powf(c->theta,-2.0f*j/c->qk_rope) : cache.inv[j];
+            float ang=pos*inv;
             cache.cs[j]=cosf(ang); cache.sn[j]=sinf(ang);
         }
-        cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.valid=1;
+        cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.trig_valid=1;
     }
     for(int j=0;j<half;j++){
         float cs=cache.cs[j],sn=cache.sn[j];
@@ -6611,6 +6667,9 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_no_i4_exact_sse = getenv("COLI_NO_I4_EXACT_SSE")?atoi(getenv("COLI_NO_I4_EXACT_SSE")):0;
+    g_no_rmsnorm_simd = getenv("COLI_NO_RMSNORM_SIMD")?atoi(getenv("COLI_NO_RMSNORM_SIMD")):0;
+    g_no_rope_inv_cache = getenv("COLI_NO_ROPE_INV_CACHE")?atoi(getenv("COLI_NO_ROPE_INV_CACHE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
