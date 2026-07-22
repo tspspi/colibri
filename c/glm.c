@@ -671,6 +671,7 @@ static void matmul_qt(float *y,const float *x,QT *w,int S);
 static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
 static int g_idot=1;
 static int g_no_i8_small_reuse=0; /* COLI_NO_I8_SMALL_REUSE=1: A/B small-nr int8 gate/up qrow reuse */
+static int g_no_i8_small_gather=0; /* COLI_NO_I8_SMALL_GATHER=1: A/B small-nr int8 gate/up direct-row quantize */
 static inline float sigmoidf(float x);
 static inline float qrow_i8(const float *x, int8_t *q, int I);
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
@@ -679,6 +680,8 @@ static void matmul_q_idot_pair_small(float *yg, float *yu, const int8_t *xq, con
                                      const int8_t *qg, const float *sg,
                                      const int8_t *qu, const float *su,
                                      int S, int I, int O);
+static int expert_gate_up_rows_small_i8(float *g,float *u,const float *x,int xstride,const int *rows,
+                                        QT *wg,QT *wu,int S);
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx);
  * that changes OMP scheduling vs separate matmul_qt calls — this
  * shifts floating-point accumulation order and can collapse MTP
@@ -719,6 +722,23 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
+static int expert_gate_up_rows_small_i8(float *g,float *u,const float *x,int xstride,const int *rows,
+                                        QT *wg,QT *wu,int S){
+    if(g_no_i8_small_gather || g_no_i8_small_reuse || !g_idot || S<1 || S>3 ||
+       wg->fmt!=1 || wu->fmt!=1 || wg->I!=wu->I || wg->O!=wu->O) return 0;
+    int I=wg->I; int8_t *xq; float *sx;
+    if((size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"expert_gate_up_rows_small_i8: shape overflow\n"); exit(1); }
+    quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)rows[s]*xstride, xq+(int64_t)s*I, I);
+    if(!g_no_i8_small_pair)
+        matmul_q_idot_pair_small(g,u,xq,sx,wg->q8,wg->s,wu->q8,wu->s,S,I,wg->O);
+    else {
+        matmul_q_idot(g,xq,sx,wg->q8,wg->s,S,I,wg->O);
+        matmul_q_idot(u,xq,sx,wu->q8,wu->s,S,I,wu->O);
+    }
+    return 1;
+}
+
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
     int rb=(I+3)/4;
@@ -3571,19 +3591,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ngroup++; continue;
             }
 #endif
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
+            if(!expert_gate_up_rows_small_i8(gg,uu,x,D,rows,&e->g,&e->u,nr)){
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
 #ifdef COLI_CUDA
-            if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
-               e->d.cuda_eligible && !omp_in_parallel() &&
-               coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;continue;
-            }
-            if(!e->slab) expert_host_ensure(m,layer,e);
+                if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
+                   e->d.cuda_eligible && !omp_in_parallel() &&
+                   coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;continue;
+                }
+                if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+            }
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
@@ -3626,11 +3648,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int q=0;q<dev_nc[di];q++){
                 int gi=dev_which[di][q],nr=group_n[gi]; ESlot *e=group_e[gi];
                 if(!dev_ok[di]){
-                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
                     double tc=g_prof?now_s():0;
-                    if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
+                    int did_small_gather=expert_gate_up_rows_small_i8(gg,uu,x,D,group_row+(int64_t)gi*S,&e->g,&e->u,nr);
+                    if(!did_small_gather){
+                        for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
+                    }
+                    if(!did_small_gather && !coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        matmul_qt(hh,gg,&e->d,nr);
+                        if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                            m->cpu_expert_rows+=(uint64_t)nr;}
+                    } else if(did_small_gather){
                         for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                         matmul_qt(hh,gg,&e->d,nr);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
@@ -6666,6 +6696,7 @@ int main(int argc, char **argv){
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     g_no_i8_small_pair = getenv("COLI_NO_I8_SMALL_PAIR")?atoi(getenv("COLI_NO_I8_SMALL_PAIR")):0;
+    g_no_i8_small_gather = getenv("COLI_NO_I8_SMALL_GATHER")?atoi(getenv("COLI_NO_I8_SMALL_GATHER")):0;
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));

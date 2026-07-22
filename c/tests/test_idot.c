@@ -270,6 +270,49 @@ static int check_expert_gate_up_small_i8_exact(int O,int I,int S){
     free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
     return 0;
 }
+static int check_expert_gate_up_small_i8_gather_exact(int O,int I,int S){
+    QT wg={0}, wu={0};
+    int stride=I+7;
+    int rows[3]={1,3,4};
+    float *xfull=malloc((size_t)(rows[S-1]+1)*stride*sizeof(float));
+    float *xg=malloc((size_t)S*I*sizeof(float));
+    float *g0=malloc((size_t)S*O*sizeof(float));
+    float *u0=malloc((size_t)S*O*sizeof(float));
+    float *g1=malloc((size_t)S*O*sizeof(float));
+    float *u1=malloc((size_t)S*O*sizeof(float));
+    int old_reuse=g_no_i8_small_reuse, old_pair=g_no_i8_small_pair, old_gather=g_no_i8_small_gather;
+    fill_qt(&wg,1,O,I);
+    fill_qt(&wu,1,O,I);
+    for(int64_t i=0;i<(int64_t)(rows[S-1]+1)*stride;i++) xfull[i]=((float)(xr()%4001)-2000.f)/500.f;
+    for(int s=0;s<S;s++) memcpy(xg+(int64_t)s*I, xfull+(int64_t)rows[s]*stride, (size_t)I*sizeof(float));
+    g_no_i8_small_reuse=0;
+    g_no_i8_small_pair=0;
+    g_no_i8_small_gather=0;
+    if(!expert_gate_up_rows_small_i8(g0,u0,xfull,stride,rows,&wg,&wu,S)){
+        fprintf(stderr,"FAIL expert_gate_up small-i8 gather helper disabled O=%d I=%d S=%d\n",O,I,S);
+        g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair; g_no_i8_small_gather=old_gather;
+        free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(xfull); free(xg); free(g0); free(u0); free(g1); free(u1);
+        return 1;
+    }
+    expert_gate_up(g1,u1,xg,&wg,&wu,S);
+    for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&g0[i],&g1[i],sizeof(float))!=0){
+        fprintf(stderr,"FAIL expert_gate_up small-i8 gather gate O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
+                O,I,S,(long long)i,(double)g0[i],(double)g1[i]);
+        g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair; g_no_i8_small_gather=old_gather;
+        free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(xfull); free(xg); free(g0); free(u0); free(g1); free(u1);
+        return 1;
+    }
+    for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&u0[i],&u1[i],sizeof(float))!=0){
+        fprintf(stderr,"FAIL expert_gate_up small-i8 gather up O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
+                O,I,S,(long long)i,(double)u0[i],(double)u1[i]);
+        g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair; g_no_i8_small_gather=old_gather;
+        free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(xfull); free(xg); free(g0); free(u0); free(g1); free(u1);
+        return 1;
+    }
+    g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair; g_no_i8_small_gather=old_gather;
+    free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(xfull); free(xg); free(g0); free(u0); free(g1); free(u1);
+    return 0;
+}
 
 int main(void){
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
@@ -352,6 +395,12 @@ int main(void){
        for(unsigned c=0;c<sizeof eg_Ss/sizeof eg_Ss[0];c++)
         if(check_expert_gate_up_small_i8_exact(eg_Os[a],eg_Is[b],eg_Ss[c])) return 1;
     printf("expert gate/up small-i8 exactness: ok\n");
+    for(int rep=0;rep<4;rep++)
+     for(unsigned a=0;a<sizeof eg_Os/sizeof eg_Os[0];a++)
+      for(unsigned b=0;b<sizeof eg_Is/sizeof eg_Is[0];b++)
+       for(unsigned c=0;c<sizeof eg_Ss/sizeof eg_Ss[0];c++)
+        if(check_expert_gate_up_small_i8_gather_exact(eg_Os[a],eg_Is[b],eg_Ss[c])) return 1;
+    printf("expert gate/up small-i8 gather exactness: ok\n");
 
     return 0;
 }
