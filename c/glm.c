@@ -675,6 +675,10 @@ static inline float sigmoidf(float x);
 static inline float qrow_i8(const float *x, int8_t *q, int I);
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O);
+static void matmul_q_idot_pair_small(float *yg, float *yu, const int8_t *xq, const float *sx,
+                                     const int8_t *qg, const float *sg,
+                                     const int8_t *qu, const float *su,
+                                     int S, int I, int O);
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx);
  * that changes OMP scheduling vs separate matmul_qt calls — this
  * shifts floating-point accumulation order and can collapse MTP
@@ -704,8 +708,12 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
         if((size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"expert_gate_up: shape overflow\n"); exit(1); }
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
-        matmul_q_idot(g,xq,sx,wg->q8,wg->s,S,I,wg->O);
-        matmul_q_idot(u,xq,sx,wu->q8,wu->s,S,I,wu->O);
+        if(!g_no_i8_small_pair)
+            matmul_q_idot_pair_small(g,u,xq,sx,wg->q8,wg->s,wu->q8,wu->s,S,I,wg->O);
+        else {
+            matmul_q_idot(g,xq,sx,wg->q8,wg->s,S,I,wg->O);
+            matmul_q_idot(u,xq,sx,wu->q8,wu->s,S,I,wu->O);
+        }
         return;
     }
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
@@ -1183,6 +1191,22 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_q_idot_pair_small(float *yg, float *yu, const int8_t *xq, const float *sx,
+                                     const int8_t *qg, const float *sg,
+                                     const int8_t *qu, const float *su,
+                                     int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const int8_t *wg=qg+(int64_t)o*I, *wu=qu+(int64_t)o*I;
+        float scg=sg[o], scu=su[o];
+        for(int s=0;s<S;s++){
+            const int8_t *xs=xq+(int64_t)s*I;
+            float ss=sx[s];
+            yg[(int64_t)s*O+o]=(float)dot_i8i8(wg,xs,I)*scg*ss;
+            yu[(int64_t)s*O+o]=(float)dot_i8i8(wu,xs,I)*scu*ss;
+        }
+    }
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
@@ -6641,6 +6665,7 @@ int main(int argc, char **argv){
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
+    g_no_i8_small_pair = getenv("COLI_NO_I8_SMALL_PAIR")?atoi(getenv("COLI_NO_I8_SMALL_PAIR")):0;
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));

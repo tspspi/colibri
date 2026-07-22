@@ -245,23 +245,28 @@ static int check_expert_gate_up_small_i8_exact(int O,int I,int S){
     float *u0=malloc((size_t)S*O*sizeof(float));
     float *g1=malloc((size_t)S*O*sizeof(float));
     float *u1=malloc((size_t)S*O*sizeof(float));
+    int old_reuse=g_no_i8_small_reuse, old_pair=g_no_i8_small_pair;
     for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=((float)(xr()%4001)-2000.f)/500.f;
     g_no_i8_small_reuse=0;
+    g_no_i8_small_pair=0;
     expert_gate_up(g0,u0,x,&wg,&wu,S);
-    g_no_i8_small_reuse=1;
+    g_no_i8_small_pair=1;
     expert_gate_up(g1,u1,x,&wg,&wu,S);
     for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&g0[i],&g1[i],sizeof(float))!=0){
         fprintf(stderr,"FAIL expert_gate_up small-i8 gate O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
                 O,I,S,(long long)i,(double)g0[i],(double)g1[i]);
+        g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair;
         free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
         return 1;
     }
     for(int64_t i=0;i<(int64_t)S*O;i++) if(memcmp(&u0[i],&u1[i],sizeof(float))!=0){
         fprintf(stderr,"FAIL expert_gate_up small-i8 up O=%d I=%d S=%d idx=%lld: %.9g != %.9g\n",
                 O,I,S,(long long)i,(double)u0[i],(double)u1[i]);
+        g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair;
         free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
         return 1;
     }
+    g_no_i8_small_reuse=old_reuse; g_no_i8_small_pair=old_pair;
     free(wg.s); free(wg.q8); free(wu.s); free(wu.q8); free(x); free(g0); free(u0); free(g1); free(u1);
     return 0;
 }
