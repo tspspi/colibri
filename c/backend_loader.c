@@ -161,8 +161,8 @@ static int coli_cuda_load(void){
         }
     }
     if(!g_cuda.dll){
-        /* fallback (GetModuleFileNameA praticamente non fallisce): cerca solo
-         * nella dir dell'applicazione e in System32, MAI la CWD. */
+        /* fallback (GetModuleFileNameA almost never fails): search only the
+         * application directory and System32, NEVER the CWD. */
         g_cuda.dll = LoadLibraryExA("coli_cuda.dll", NULL,
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     }

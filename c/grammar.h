@@ -1,33 +1,34 @@
-/* grammar.h — draft grammaticale (#48): GBNF (sottoinsieme) valutata a livello di BYTE.
+/* grammar.h — grammar drafting (#48): GBNF (subset) evaluated at BYTE level.
  *
- * Idea: nei workload a output vincolato (JSON/NDJSON, function calling, estrazione
- * strutturata) una frazione dei token e' DETERMINISTICA data la grammatica: parentesi,
- * virgolette, nomi delle chiavi, separatori, valori enum. Quegli span sono draft
- * gratuiti ad acceptance ~1: nessuna testa, nessuna lookup table — la verifica
- * batch-union li conferma e paga UN forward per piu' token. E si aggancia anche dove
- * la testa MTP int4 non parte (#8).
+ * Idea: in constrained-output workloads (JSON/NDJSON, function calling, structured
+ * extraction), a fraction of the tokens is DETERMINISTIC given the grammar:
+ * braces, quotes, key names, separators, enum values. Those spans are free drafts
+ * with acceptance ~1: no head, no lookup table — batch-union verification confirms
+ * them and pays ONE forward for multiple tokens. It also helps where the int4 MTP
+ * head does not engage (#8).
  *
- * La grammatica non vincola MAI il campionamento: propone solo draft, che la verifica
- * accetta o rifiuta come qualunque altro draft. Grammatica sbagliata o fuori sync =>
- * draft rifiutati, output IDENTICO. E' un acceleratore puro, mai un filtro.
+ * The grammar NEVER constrains sampling: it only proposes drafts, which verification
+ * accepts or rejects like any other draft. A wrong or out-of-sync grammar =>
+ * rejected drafts, IDENTICAL output. It is a pure accelerator, never a filter.
  *
- * Sottoinsieme GBNF (stile llama.cpp), valutato sui BYTE:
- *   root ::= obj+                          # la regola di partenza si chiama "root"
+ * GBNF subset (llama.cpp style), evaluated on BYTES:
+ *   root ::= obj+                          # the entry rule is named "root"
  *   obj  ::= "{" pair ("," pair)* "}" "\n"
  *   str  ::= "\"" [^"\\]* "\""
- * Supportato: letterali "..." (escape \" \\ \n \r \t \xHH), classi [a-z0-9-] anche
- * negate [^...], riferimenti a regole, gruppi (...), postfissi ? * +, commenti #,
- * alternate con |, epsilon come "". Le regole possono estendersi su piu' righe: una
- * nuova regola inizia dove un identificatore e' seguito da "::=".
- * NON supportato: ripetizioni {m,n}, range unicode nelle classi (le classi lavorano
- * sui byte; per l'UTF-8 multibyte usare i letterali, che passano i byte grezzi).
- * Ricorsione sinistra: intercettata dal tetto di profondita' -> il walker si spegne
- * (alive=0) e la generazione prosegue senza draft. Mai un blocco, mai un crash.
+ * Supported: "..." literals (escapes \" \\ \n \r \t \xHH), classes [a-z0-9-]
+ * including negated [^...], rule references, groups (...), postfixes ? * +,
+ * # comments, alternation with |, epsilon as "". Rules may span multiple lines:
+ * a new rule starts where an identifier is followed by "::=".
+ * NOT supported: {m,n} repetition, unicode ranges in classes (classes work on
+ * bytes; for multibyte UTF-8, use literals, which pass through raw bytes).
+ * Left recursion: caught by the depth cap -> the walker disables itself
+ * (`alive=0`) and generation continues without drafts. Never a hang, never a crash.
  *
- * Il walker e' un PDA con INSIEME di stack (come llama.cpp): ogni stack in forma
- * normale ha in cima un simbolo terminale (classe di byte) oppure e' vuoto (parse
- * completabile qui). gr_forced() estende il prefisso finche' esiste UN SOLO byte
- * legale e il parse non e' terminabile: quel prefisso e' il draft forzato.
+ * The walker is a PDA with a SET of stacks (like llama.cpp): every stack in
+ * normal form either has a terminal symbol (byte class) on top or is empty
+ * (the parse can complete here). `gr_forced()` extends the prefix while there
+ * is EXACTLY ONE legal byte and the parse is not yet terminable: that prefix
+ * is the forced draft.
  */
 #ifndef COLI_GRAMMAR_H
 #define COLI_GRAMMAR_H
@@ -38,22 +39,22 @@
 #include <string.h>
 
 #define GR_MAX_RULES  1024
-#define GR_MAX_STACKS 64      /* ambiguita' massima seguita in parallelo */
-#define GR_MAX_DEPTH  64      /* profondita' massima di uno stack del PDA */
+#define GR_MAX_STACKS 64      /* maximum ambiguity tracked in parallel */
+#define GR_MAX_DEPTH  64      /* maximum depth of one PDA stack */
 
-typedef struct { uint8_t bits[32]; } GrCls;              /* insieme di byte ammessi */
+typedef struct { uint8_t bits[32]; } GrCls;              /* set of allowed bytes */
 enum { GR_CLS = 0, GR_REF = 1 };
 typedef struct { uint8_t t; int16_t ref; GrCls c; } GrSym;
-typedef struct { GrSym *s; int n, cap; } GrAlt;          /* una sequenza di simboli */
+typedef struct { GrSym *s; int n, cap; } GrAlt;          /* one sequence of symbols */
 typedef struct { GrAlt *a; int n, cap; char name[64]; } GrRule;
 typedef struct { GrRule r[GR_MAX_RULES]; int n; int root; char err[160]; } Grammar;
 
-/* frame = posizione dentro un alternate: (regola, alternate, simbolo) */
+/* frame = position within one alternate: (rule, alternate, symbol) */
 typedef struct { int16_t r, a, s; } GrFrame;
 typedef struct { GrFrame f[GR_MAX_DEPTH]; int16_t n; } GrStack;
 typedef struct { Grammar *G; GrStack st[GR_MAX_STACKS]; int n; int alive; } GrState;
 
-/* ---------- costruzione ---------- */
+/* ---------- construction ---------- */
 
 static int gr__alt_new(Grammar *G, int ri){
     GrRule *R=&G->r[ri];
@@ -79,14 +80,14 @@ static int gr__rule(Grammar *G, const char *name, int len){
     memcpy(R->name,name,(size_t)len);
     return G->n++;
 }
-static int gr__anon(Grammar *G){                          /* regola sintetica ($n non collide: '$' non e' un identificatore */
+static int gr__anon(Grammar *G){                          /* synthetic rule ($n cannot collide: '$' is not an identifier */
     if(G->n>=GR_MAX_RULES) return -1;
     GrRule *R=&G->r[G->n]; memset(R,0,sizeof *R);
     snprintf(R->name,sizeof R->name,"$%d",G->n);
     return G->n++;
 }
 
-/* ---------- parser GBNF ---------- */
+/* ---------- GBNF parser ---------- */
 
 static const char* gr__ws(const char *p){
     for(;;){
@@ -105,7 +106,7 @@ static int gr__hex(char c){
     if(c>='A'&&c<='F') return c-'A'+10;
     return -1;
 }
-static int gr__esc(const char **pp){                      /* dopo la barra: byte 0-255 o -1 */
+static int gr__esc(const char **pp){                      /* after '\' : byte 0-255 or -1 */
     const char *p=*pp; int c=-1;
     switch(*p){
         case 'n': c='\n'; break;  case 'r': c='\r'; break;  case 't': c='\t'; break;
@@ -236,7 +237,7 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
     *pp=p;
     return 0;
 }
-/* parse del testo GBNF. 0 = ok; -1 = errore (messaggio in G->err). */
+/* Parse GBNF text. 0 = ok; -1 = error (message in G->err). */
 static int gr_parse(Grammar *G, const char *src){
     memset(G,0,sizeof *G); G->root=-1;
     const char *p=src;
@@ -310,13 +311,13 @@ static void gr_state_init(GrState *S, Grammar *G){
     if(S->n==0) S->alive=0;
 }
 /* avanza di un byte. 1 = consumato; 0 = byte non ammesso (stato INVARIATO);
- * -1 = walker spento (overflow: da qui in poi niente piu' draft). */
+ * -1 = walker disabled (overflow: no more drafts from this point on). */
 static int gr_accept(GrState *S, unsigned char b){
     if(!S->alive) return -1;
     GrState out; out.G=S->G; out.n=0; out.alive=1;
     for(int i=0;i<S->n;i++){
         GrStack *k=&S->st[i];
-        if(k->n==0) continue;                             /* parse gia' completo: non consuma */
+        if(k->n==0) continue;                             /* parse already complete: consumes nothing */
         GrFrame *t=&k->f[k->n-1];
         GrSym *sy=&S->G->r[t->r].a[t->a].s[t->s];
         if(!(sy->c.bits[b>>3]&(1u<<(b&7)))) continue;
@@ -328,8 +329,8 @@ static int gr_accept(GrState *S, unsigned char b){
     memcpy(S->st,out.st,(size_t)out.n*sizeof(GrStack));
     return 1;
 }
-/* insieme dei byte ammessi adesso (bitmap 256). Ritorna il conteggio;
- * *can_end = 1 se il parse puo' terminare qui (quindi il modello puo' emettere EOS). */
+/* set of bytes currently allowed (256-bit bitmap). Returns the count;
+ * *can_end = 1 if the parse may end here (so the model may emit EOS). */
 static int gr_admissible(const GrState *S, unsigned char mask[32], int *can_end){
     memset(mask,0,32); int end=0;
     for(int i=0;i<S->n;i++){
@@ -344,8 +345,9 @@ static int gr_admissible(const GrState *S, unsigned char mask[32], int *can_end)
     if(can_end)*can_end=end;
     return cnt;
 }
-/* prefisso FORZATO: si estende finche' c'e' UN SOLO byte legale e il parse non e'
- * terminabile (li' il modello potrebbe fermarsi). Non muta S. Ritorna i byte scritti. */
+/* FORCED prefix: extend while there is exactly ONE legal byte and the parse
+ * cannot end yet (there the model could legitimately stop). Does not mutate S.
+ * Returns the bytes written. */
 static int gr_forced(const GrState *S, char *out, int max){
     if(!S->alive||S->n==0) return 0;
     GrState cp=*S;

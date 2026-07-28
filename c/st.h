@@ -1,9 +1,9 @@
-/* Indicizzazione e lettura on-demand di tensori da piu' file safetensors.
- * Equivale a Shards in engine.py, ma:
- *   - legge con pread (niente mmap) + posix_fadvise(DONTNEED) -> le pagine NON
- *     restano residenti nel processo. E' la correzione del bug di RSS: cosi' la
- *     RAM di picco resta densa+cache, non l'intero modello. (vedi memoria mmap-rss-bug)
- *   - converte sempre in float32 in uscita (BF16/F16/F32 supportati). */
+/* On-demand indexing and reading of tensors from multiple safetensors files.
+ * Equivalent to `Shards` in `engine.py`, but:
+ *   - reads with pread (no mmap) + posix_fadvise(DONTNEED) -> pages do NOT
+ *     stay resident in the process. This fixes the RSS bug: peak RAM stays at
+ *     dense+cache, not the whole model. (see mmap-rss-bug memory note)
+ *   - always converts output to float32 (BF16/F16/F32 supported). */
 #ifndef ST_H
 #define ST_H
 #define _GNU_SOURCE
@@ -19,9 +19,9 @@
 #include "json.h"
 #include "compat.h"
 
-/* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
- * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
- * malloc gigante prima ancora di leggere: lo respingiamo. */
+/* Safetensors header size cap: real headers are small
+ * (KB..a few MB). A crafted file claiming a huge `hlen` would force a giant
+ * malloc before we even start reading, so reject it. */
 #define ST_MAX_HEADER (512ll << 20)
 
 typedef struct {
@@ -42,7 +42,7 @@ typedef struct {
     int        nfd;
     int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
-                           * costava decine di secondi/token (misurato sul primo run reale) */
+                           * cost tens of seconds/token (measured on the first real run) */
     int        hcap;
 } shards;
 #define ST_MAX_SHARDS 512
@@ -87,28 +87,28 @@ static int st_open_fd(shards *S, const char *path) {
     if (fd < 0) { perror(path); exit(1); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
+    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager lookup, then thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
     S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
-    S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
+    S->dfds[S->nfd] = -1;                                /* no equivalent: buffered only */
 #endif
     S->nfd++;
     return fd;
 }
 
-/* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
- * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
+/* O_DIRECT twin fd for the same file (bypasses the page cache: buffered reads on
+ * ext4-in-VHDX choke at ~0.8 GB/s, O_DIRECT reaches 2.3+; measured). -1 if unavailable. */
 static int st_direct_fd(shards *S, int fd) {
     for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return S->dfds[i];
     return -1;
 }
 
-/* indicizza tutti i model-*.safetensors in snap_dir */
-/* pread completo: chunk-loop (una singola pread si ferma a ~2^31 byte su Linux
- * — i tensori bf16 grandi la superano), riprova su EINTR e riporta un errore
- * ONESTO: perror stampava "Success" su una short-read (errno resta 0), lo
- * stesso sintomo corretto in glm.c per #236. ST_PREAD_CHUNK e' sovrascrivibile
+/* Index all `model-*.safetensors` files in `snap_dir`. */
+/* Full pread: chunk loop (one pread stops at ~2^31 bytes on Linux
+ * — large bf16 tensors exceed that), retry on EINTR, and report an
+ * HONEST error: perror printed "Success" on a short read (`errno` stayed 0),
+ * the same symptom fixed in `glm.c` for #236. `ST_PREAD_CHUNK` is overrideable
  * per i test. EN: full pread — chunk loop (one pread caps at ~2^31 bytes and
  * big bf16 tensors exceed it), EINTR retry, honest short-read errors.
  * Exits on failure, like every st.h reader. */
@@ -162,10 +162,9 @@ static void st_init(shards *S, const char *snap_dir) {
         int64_t fsz = (int64_t)sst.st_size;
         uint64_t hlen;
         st_pread_full(fd, &hlen, 8, 0, "pread hlen");
-        /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
-         * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
-         * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
-         * malloc gigante. */
+        /* Malicious/truncated file: `hlen` must fit in the file after the 8-byte
+         * prefix and stay below the cap. Without this bound `hlen+1` can overflow
+         * (`malloc(0)` then `hdr[hlen]=0` out of bounds) or force a giant malloc. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
             fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
                     files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
@@ -185,18 +184,18 @@ static void st_init(shards *S, const char *snap_dir) {
             jval *dt = json_get(m, "dtype");
             jval *off = json_get(m, "data_offsets");
             jval *shp = json_get(m, "shape");
-            /* un header crafted puo' omettere i campi o dare tipi sbagliati:
-             * senza questi guard si dereferenzia NULL (json_get) o si legge
-             * off->kids[0/1] oltre i limiti dell'array. */
+            /* A crafted header may omit fields or provide wrong types:
+             * without these guards we would dereference NULL (`json_get`) or
+             * read `off->kids[0/1]` past the end of the array. */
             if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
                 !shp || shp->t != J_ARR) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
-            /* offset dichiarati dal file: non-negativi, ordinati e dentro al
-             * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
-             * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
-             * oppure off punta fuori dal file. */
+            /* File-declared offsets: non-negative, ordered, and inside the file.
+             * Otherwise `nbytes=b0-a0` becomes negative -> giant `malloc((size_t))`,
+             * and `memcpy` in `st_read_f32` overruns the caller buffer;
+             * or `off` points outside the file. */
             if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
@@ -206,10 +205,10 @@ static void st_init(shards *S, const char *snap_dir) {
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        free(arena); /* jval nodes remain leaked: acceptable, one-time at startup */
         free(hdr);
     }
-    /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
+    /* Hash index built after indexing is complete (indices stay valid after reallocs). */
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = malloc(S->hcap * sizeof(int));
     for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
@@ -235,17 +234,17 @@ static st_tensor *st_find(shards *S, const char *name) {
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 
-/* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
- * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
- * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
- * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
+/* ASYNC prefetch: tell the kernel to start reading the tensor pages in the
+ * background (readahead). This overlaps expert I/O with compute: we
+ * prefetch the whole expert set of a layer, then the synchronous preads find a warm cache.
+ * No-op if the tensor does not exist (for example the first `.qs` before reading). */
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
-/* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
- * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
+/* Read one tensor into a caller-provided float32 buffer (`numel` floats).
+ * `drop=1` -> advise the kernel to discard the pages (for streaming experts). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -271,8 +270,8 @@ static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
 
-/* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
- * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
+/* Read the RAW bytes of a tensor (no dtype conversion): for weights already
+ * quantized as int4/int8 in our container (dtype U8). `drop=1` -> fadvise DONTNEED. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -280,9 +279,9 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
-/* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
- * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
- * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
+/* Read a SLICE of a tensor: `n_elems` starting at element `elem_off`.
+ * Used for GLM fused experts (one tensor = block [E, ...]): read only the
+ * requested expert via pread on the sub-range, without reading the whole block. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }

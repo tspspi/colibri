@@ -1,42 +1,45 @@
-/* Motore GLM-5.2 (architettura glm_moe_dsa) in C puro.
- * Stadio B: replica fedele del forward di transformers (modeling_glm_moe_dsa.py):
- *   - attenzione MLA (q/kv-LoRA, RoPE interleaved parziale)
- *   - router sigmoid + noaux_tc (n_group=1) con routed_scaling_factor
- *   - shared expert + expert routed in streaming dal disco (per-expert)
- *   - primi first_k_dense_replace layer densi
- * Il DSA indexer e' un NO-OP per seq <= index_topk (seleziona tutte le key): qui si usa
- * attenzione causale densa -> output identico all'oracolo su prompt corti.
+/* Pure-C GLM-5.2 engine (`glm_moe_dsa` architecture).
+ * Stage B: faithful reproduction of the transformers forward pass
+ * (`modeling_glm_moe_dsa.py`):
+ *   - MLA attention (q/kv-LoRA, partially interleaved RoPE)
+ *   - sigmoid router + noaux_tc (`n_group=1`) with `routed_scaling_factor`
+ *   - shared expert + routed experts streamed from disk (per-expert)
+ *   - first `first_k_dense_replace` layers kept dense
+ * The DSA indexer is a NO-OP for seq <= `index_topk` (it selects all keys): in that
+ * case we use dense causal attention -> output identical to the oracle on short prompts.
  *
- * QUANTIZZAZIONE: gli expert (streaming) e la parte DENSA residente (attenzione, lm_head,
- * embed, mlp densa, shared expert) sono tenuti in int8 per-riga + scala (dequant-on-use).
- * E' cio' che fa entrare GLM-5.2 nei 15 GB: ~17B param residenti a int4 ~= 8.7 GB.
- * Norme/router/bias restano f32 (piccoli e sensibili).
+ * QUANTIZATION: the experts (streamed) and the resident DENSE part (attention, lm_head,
+ * embed, dense MLP, shared expert) are stored as per-row int8 + scale (dequant-on-use).
+ * That is what makes GLM-5.2 fit in 15 GB: ~17B resident params at int4 ~= 8.7 GB.
+ * Norms/router/bias stay in f32 (small and sensitive).
  *
- * Validazione: stessi token id di ref_glm.json (oracolo transformers, c/tools/make_glm_oracle.py).
+ * Validation: same token ids as `ref_glm.json` (transformers oracle,
+ * `c/tools/make_glm_oracle.py`).
  *   build: make glm   run: SNAP=./glm_tiny ./glm <cap> <expert_bits> <dense_bits>
- *   TF=1 -> teacher-forcing (valida il prefill su tutta la sequenza)
+ *   TF=1 -> teacher forcing (validates the full prefill over the whole sequence)
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <limits.h>
-#include <pthread.h>                              /* thread I/O del PILOTA */
+#include <pthread.h>                              /* PILOT I/O thread */
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                           /* select() serve-loop polling (#68); not on native MinGW */
 #include <sys/resource.h>
-#include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
+#include <sys/mman.h>                             /* mlock: pin pages in RAM / wire pages into RAM */
 #ifdef __linux__
-#include <sys/syscall.h>                          /* COLI_NUMA: mbind degli slab expert / expert-slab interleave */
+#include <sys/syscall.h>                          /* COLI_NUMA: mbind for expert slabs / expert-slab interleave */
 #endif
-#include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
-#include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
+#include <sys/stat.h>                             /* fstat for shard mmap (COLI_MMAP) */
+#include <signal.h>                               /* SIGINT = graceful stop of the current turn in serve mode */
 #endif
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>                           /* hw.physmem: fallback RAM autodetect on FreeBSD */
@@ -46,7 +49,7 @@
 #include <sys/vfs.h>                              /* statfs: real fs-type check for the 9p warning (below) */
 #endif
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
-#include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
+#include <cpuid.h>                                /* hwinfo_emit: CPU brand string without /proc */
 #endif
 #include "st.h"
 #ifdef __linux__
@@ -54,11 +57,11 @@
 #endif
 #include "tok.h"
 #include "tier.h"
-#include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
+#include "grammar.h"                              /* method F: grammar drafts (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #ifdef _OPENMP
-#include <omp.h>                                  /* scratch per-thread nell'attention */
+#include <omp.h>                                  /* per-thread scratch in attention */
 #else
 static inline int omp_get_max_threads(void){ return 1; }
 static inline int omp_get_thread_num(void){ return 0; }
@@ -71,9 +74,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #include <omp.h>
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
-/* routing precalcolata dalla GPU (layer CB): moe() la usa e salta la FASE A */
+/* Routing precomputed on the GPU (CB layer): `moe()` uses it and skips PHASE A. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
-static const float *g_pre_sh;   /* output dello shared expert gia' calcolato su GPU */
+static const float *g_pre_sh;   /* shared-expert output already computed on the GPU */
 #endif
 #if defined(__AVX2__) || defined(__AVXVNNI__) || defined(__AVX512F__) || defined(__AVX512BW__) || defined(__AVX512VNNI__)
 #include <immintrin.h>
@@ -85,12 +88,12 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
 }
-#elif defined(__SSSE3__)
 #elif defined(__SSE4_1__)
 #include <smmintrin.h>
 static inline int hsum128_i32(__m128i v){
     v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
 }
+#elif defined(__SSSE3__)
 #include <tmmintrin.h>
 static inline int hsum128_i32(__m128i v){
     v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
@@ -111,18 +114,18 @@ typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
-    int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
+    int stop_ids[8], n_stop;                     /* eos_token_id from config (GLM-5.2 has 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
-    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
+    int8_t idx_type[128];                        /* per layer: 1=full (compute), 0=shared (reuse) */
     float eps, theta, attn_scale, routed_scale;
 } Cfg;
 
-/* tensore [O,I] in uno di tre formati:
+/* [O,I] tensor in one of three formats:
  *   fmt=0 F32   -> qf
- *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
- *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
- * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+ *   fmt=1 INT8  -> q8 (1 byte/param) + one scale per row
+ *   fmt=2 INT4  -> q4 (2 values per byte, packed) + one scale per row
+ * INT4 is what lets the resident dense path fit in 15 GB (0.5 byte/param). */
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 stores both int4 and packed int2. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
@@ -130,7 +133,7 @@ typedef struct {
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
-static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
+static int64_t qt_bytes(const QT *t){    /* resident bytes of the tensor */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
@@ -158,10 +161,10 @@ typedef struct {
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
 } Layer;
 
-/* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
- * VISTE dentro `slab` (una sola pread coalescente); nel fallback hanno buffer propri.
- * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
- * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
+/* One expert slot: quantized weights + scales. In the pre-quantized container g/u/d are
+ * VIEWS into `slab` (one coalesced pread); in the fallback path they own separate buffers.
+ * slab_cap/fslab_cap: allocated capacity — `ws[]` slots are reused ACROSS layers, and
+ * experts are not all the same size (the MTP int8 layer is 2x the int4 layers). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
 
@@ -182,58 +185,59 @@ typedef struct {
 
 typedef struct {
     Cfg c; shards S;
-    int ebits, dbits;                            /* bit expert / bit densa */
+    int ebits, dbits;                            /* expert bits / dense bits */
     QT embed, lm_head; float *final_norm;
     Layer *L;
-    /* KV-cache MLA COMPRESSA: per token si tiene solo il latente normato [kv_lora] e
-     * k_rot [qk_rope] (576 vs 32768 valori/token). k_nope e value si ricostruiscono al
-     * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
-    float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
-    int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
+    /* COMPRESSED MLA KV-cache: per token we keep only the normalized latent [kv_lora] and
+     * k_rot [qk_rope] (576 vs 32768 values/token). k_nope and value are reconstructed
+     * on the fly with kv_b. This is what makes long context manageable in 15 GB
+     * (64 heads, no GQA). */
+    float **Lc, **Rc; int max_t;                 /* aliases of the active KVState */
+    int *kv_start;                               /* first valid position in the layer KV (MTP: partial) */
     KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
-    float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
-    ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
-    ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
-    uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
-    uint32_t **eheat;                            /* calore recente per promotion/demotion live */
-    uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
-    /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
+    ESlot **ecache; int *ecn; int ecap;          /* per-layer expert LRU */
+    float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* device-side KV shadow (decode) */
+    ESlot ws[64];                                /* current layer working set (parallel loads) */
+    ESlot **pin; int *npin;                      /* HOT-STORE: experts pinned in RAM (never evicted) */
+    uint32_t **eusage;                           /* persistent counters (for STATS/PIN) */
+    uint32_t **eheat;                            /* recent heat for live promotion/demotion */
+    uint32_t **elast, eaccess_clock;              /* session-local recency for LFRU */
+    /* DSA lightning indexer (active only if out-idx-* weights are present) */
     int has_dsa;
-    QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
+    QT *ix_wq, *ix_wk, *ix_wp;                   /* for each FULL layer: wq_b, wk, weights_proj */
     float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
-    float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
-    int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
-    /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
+    float **Ic;                                  /* KVState alias: indexer cache [max_t*hd] */
+    int *dsa_sel, *dsa_nsel; int dsa_scap;       /* per-position selection for the current batch */
+    /* MTP head (`n_layers` layer, DeepSeek-V3 style): native drafts with high acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
-    float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
-    uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
-    int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
+    float *hlast, *h_all;                        /* pre-norm hidden state: last position / all batch positions */
+    uint64_t mtp_prop, mtp_acc;                  /* acceptance statistics */
+    int **eroute; int *enr;                      /* method C: routing of the LAST token per layer */
     uint64_t eclock, hits, miss, ereq;
-    uint64_t hit_pin, hit_ecache;                /* split di hits per tier (#336): pin vs LRU ecache */
+    uint64_t hit_pin, hit_ecache;                /* split of hits by tier (#336): pin vs LRU ecache */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
-    uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
+    uint64_t n_fw, n_emit;                       /* method E: decode forwards / emitted tokens */
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
     uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_ewait, t_emm, t_ecpu, t_egpu, t_route, t_p2p, t_attn, t_kvb, t_head;
     uint64_t n_p2p;                              /* P0 execution profile: tier split + residual hops */
     uint64_t cpu_expert_rows; int64_t cpu_expert_bytes;
-                                                 /* profiling: dove va il tempo (wall del
-                                                  * thread di compute; il servizio disco
-                                                  * overlappato vive in g_edisk_ns) */
+                                                 /* profiling: where time goes (wall time on the
+                                                  * compute thread; overlapped disk service
+                                                  * lives in g_edisk_ns) */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
     int64_t resident_bytes;
-    /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
-     * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
+    /* DISK_SPLIT=1: split DISK LOADs (LRU miss -> expert_load) by context and by
+     * layer type. ld_ctx: 0=main/verify/prefill, 1=inside mtp_draft, 2=inside mtp_absorb. */
     int ld_ctx;
-    uint64_t miss_draft, miss_absorb;            /* miss in moe() per contesto */
-    uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
-    uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
+    uint64_t miss_draft, miss_absorb;            /* misses in moe() by context */
+    uint64_t ld_mtp, ld_main;                    /* expert_load by layer type (MTP int8 vs main int4) */
+    uint64_t bytes_mtp, bytes_main;              /* bytes read from disk by layer type */
 } Model;
 
-static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
+static void usage_save(Model *m);        /* self-learning cache: defined next to stats_dump */
 static float *falloc(int64_t n);
 static int g_albate_layer=-1;
 static float *g_albate_dir=NULL;
@@ -379,10 +383,10 @@ static void cuda_stats_print(void){
     }
     uint64_t calls=0,experts=0,rows=0; double h2d=0,kernel=0,d2h=0;
     coli_cuda_group_stats(&calls,&experts,&rows,&h2d,&kernel,&d2h);
-    if(calls) fprintf(stderr,"[CUDA] expert groups: %llu call, %llu expert, %llu righe "
+    if(calls) fprintf(stderr,"[CUDA] expert groups: %llu call, %llu expert, %llu rows "
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
-        getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
+        getenv("COLI_CUDA_PROFILE")?"; timing below":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
 }
@@ -448,17 +452,17 @@ static void prof_base(Model *m, ProfBase *b){
 }
 
 static float *falloc(int64_t n){
-    /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
-     * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
+    /* Anti-wrap guard (reported in PR #25): absurd n from hostile model files must not
+     * turn into a tiny malloc. No calloc: memset is too expensive on the hot path. */
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
-/* ---- Accumulatore int4->float a 512 bit / 512-bit int4->float accumulator ----
- * Stessa matematica lossless di matmul_i4 (nibble->f32, FMA), ma 32 pesi/iter su
- * due catene FMA indipendenti. NON bit-identico al vecchio ordine: la riduzione
- * ad albero accumula MENO errore della somma sequenziale (misurato 2-4x più
- * vicino all'oracolo double sulle forme reali; perplexity invariata, +4-7% sul
- * decode con routing CPU-heavy — vedi docs/experiments/glm52-6x5090-2026-07-12.md).
+/* ---- 512-bit int4->float accumulator / Accumulatore int4->float a 512 bit ----
+ * Same lossless math as `matmul_i4` (nibble->f32, FMA), but 32 weights/iter on
+ * two independent FMA chains. NOT bit-identical to the old order: tree reduction
+ * accumulates LESS error than sequential summation (measured 2-4x closer to the
+ * double oracle on real shapes; perplexity unchanged, +4-7% on decode with
+ * CPU-heavy routing — see docs/experiments/glm52-6x5090-2026-07-12.md).
  * EN: same lossless math as matmul_i4, 32 weights/iter on two independent FMA
  * chains. Not bit-identical to the old order: tree reduction accumulates LESS
  * rounding than sequential summation. I4_ACC512=0 restores the old order (A/B). */
@@ -477,8 +481,8 @@ static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
-/* selftest contro il riferimento scalare (I4_ACC512_TEST=1): copre l'ordine dei
- * nibble e ogni multiplo di 32. / selftest vs the scalar reference. */
+/* Self-test against the scalar reference (`I4_ACC512_TEST=1`): covers nibble order
+ * and every multiple of 32. / selftest vs the scalar reference. */
 static int i4_acc512_selftest(void){
     enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
     for(int i=0;i<N;i++){
@@ -502,7 +506,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
     for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
 }
-/* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
+/* y[S,O] = x[S,I] @ W^T with per-row int8-quantized W + scale[O] (dequant-on-use) */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
@@ -521,9 +525,9 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 #endif
             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
 }
-/* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
-static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
+/* y[S,O] = x[S,I] @ W^T with W packed as int4 (2 values/byte) + scale[O]. */
 static int g_no_i4_exact_sse=0; /* COLI_NO_I4_EXACT_SSE=1: A/B x86 SSE4.1 exact int4 GEMM path */
+static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
@@ -535,15 +539,14 @@ static int g_no_i4_exact_sse=0; /* COLI_NO_I4_EXACT_SSE=1: A/B x86 SSE4.1 exact 
 #ifdef __AVX2__
             const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
             __m256 acc=_mm256_setzero_ps();
-            for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));   /* 8 byte=16 nibble */
+            for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));   /* 8 bytes = 16 nibbles */
                 __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                __m128i nib=_mm_unpacklo_epi8(lo,hi);                                       /* nibble in ordine */
+                __m128i nib=_mm_unpacklo_epi8(lo,hi);                                       /* nibbles in memory order */
                 __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
                 __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
-#elif defined(__ARM_NEON)
 #elif defined(__SSE4_1__)
             if(!g_no_i4_exact_sse){
                 const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8);
@@ -559,10 +562,11 @@ static int g_no_i4_exact_sse=0; /* COLI_NO_I4_EXACT_SSE=1: A/B x86 SSE4.1 exact 
                     for(int k=0;k<16;k+=2) a+=tmp[k]+tmp[k+1];
                 }
             }
+#elif defined(__ARM_NEON)
             const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
-            for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 byte=16 nibble */
-                uint8x8x2_t z=vzip_u8(vand_u8(by,m4), vshr_n_u8(by,4));        /* nibble in ordine */
+            for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 bytes = 16 nibbles */
+                uint8x8x2_t z=vzip_u8(vand_u8(by,m4), vshr_n_u8(by,4));        /* nibbles in memory order */
                 int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[0]),b8));
                 int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[1]),b8));
                 ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
@@ -668,9 +672,9 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
 }
 
 static void matmul_qt(float *y,const float *x,QT *w,int S);
-static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
 static int g_idot=1;
 static int g_no_i8_small_reuse=0; /* COLI_NO_I8_SMALL_REUSE=1: A/B small-nr int8 gate/up qrow reuse */
+static int g_no_i8_small_pair=0;  /* COLI_NO_I8_SMALL_PAIR=1: A/B small-nr int8 gate/up shared output pass */
 static int g_no_i8_small_gather=0; /* COLI_NO_I8_SMALL_GATHER=1: A/B small-nr int8 gate/up direct-row quantize */
 static inline float sigmoidf(float x);
 static inline float qrow_i8(const float *x, int8_t *q, int I);
@@ -683,16 +687,18 @@ static void matmul_q_idot_pair_small(float *yg, float *yu, const int8_t *xq, con
 static int expert_gate_up_rows_small_i8(float *g,float *u,const float *x,int xstride,const int *rows,
                                         QT *wg,QT *wu,int S);
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx);
+static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
  * that changes OMP scheduling vs separate matmul_qt calls — this
  * shifts floating-point accumulation order and can collapse MTP
  * draft acceptance by flipping near-ties (#163). */
-/* #163: l'acceptance MTP crolla quando il forward di draft (S=1) e quello di verifica
 static int g_no_rmsnorm_simd=0; /* COLI_NO_RMSNORM_SIMD=1: A/B x86 SIMD output pass for rmsnorm */
- * (S>=2) non calcolano la STESSA funzione. Tre interruttori dipendono da S: il gate
- * int4-IDOT (S>=g_i4s — asimmetrico proprio dove g_i4s>1), la fusione gate+up solo-S==1,
- * e la soglia righe del GEMM Metal. Con SPEC_PIN=1 (default) ogni forward emesso mentre
- * i draft del modello sono attivi resta sulla famiglia di kernel di S=1: draft e verifica
- * coincidono per costruzione. Prefill e decode non speculativo sono intoccati.
+/* #163: MTP acceptance collapses when the draft forward (S=1) and verify forward
+ * (S>=2) do not compute the SAME function. Three switches depend on S: the
+ * int4-IDOT gate (S>=g_i4s — asymmetric exactly where g_i4s>1), the S==1-only
+ * gate+up fusion, and the Metal GEMM row threshold. With SPEC_PIN=1 (default)
+ * every forward issued while model drafts are active stays on the S=1 kernel
+ * family: draft and verify match by construction. Prefill and non-speculative
+ * decode are untouched.
  * EN: MTP acceptance collapses when the draft (S=1) and verify (S>=2) forwards do not
  * compute the SAME function. Three switches are S-dependent: the int4 IDOT gate
  * (S>=g_i4s — asymmetric exactly on ISAs where g_i4s>1), the S==1-only gate+up fusion,
@@ -704,7 +710,6 @@ static int g_spec_pin=1;
 static int g_spec_live=0;                    /* set by spec_decode while drafts are live */
 static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
-    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
     if(!g_no_i8_small_reuse && g_idot && S>=1 && S<=3 &&
        wg->fmt==1 && wu->fmt==1 && wg->I==wu->I && wg->O==wu->O){
         int I=wg->I; int8_t *xq; float *sx;
@@ -719,6 +724,7 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
         }
         return;
     }
+    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
@@ -777,10 +783,10 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
             y[(int64_t)s*O+o]=a*sc; } }
 }
-/* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
- * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
- * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
- * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
+/* ---- INTEGER KERNELS (IDOT): activations quantized to per-row int8 (absmax/127,
+ * Q8_0 style), integer dot product via AVX2 maddubs/madd — no f32 conversion of
+ * weights on the hot path. ~2-3x on quantized matmuls; added error ~0.3% RMS per
+ * matmul (from int8 activations). IDOT=0 restores the exact f32 path. */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 #define IDOT_KERNEL "avx512-vnni"
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
@@ -799,17 +805,13 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
-                       * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
-                       * IDOT pays even at S=1 (decode); measured on Apple M-series. */
+static int g_i4s=1;   /* SDOT present: int4 IDOT is worthwhile even at S=1 (decode).
+                       * Measured on Apple M-series: +14%%, expert matmul -16%%. */
 #elif defined(__VSX__)
-static int g_i4s=1;   /* POWER8 vec_msum: qui il fallback f32 e' SCALARE, quindi l'IDOT
-                       * int4 conviene anche a S=1. Misurato su POWER8 S824 (vedi PR).
-                       * EN: on VSX the f32 fallback is plain scalar C, so int4 IDOT
-                       * pays even at S=1. Measured on a POWER8 S824 (see PR). */
+static int g_i4s=1;   /* POWER8 vec_msum: here the f32 fallback is SCALAR, so int4 IDOT
+                       * is worthwhile even at S=1. Measured on a POWER8 S824 (see PR). */
 #else
-static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
-                       * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
+static int g_i4s=2;   /* Without SDOT / elsewhere: original threshold (author's AVX2 measurement). */
 #endif
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0;
@@ -849,8 +851,8 @@ static inline int hsum256_i32(__m256i v){
     return _mm_cvtsi128_si32(lo);
 }
 #endif
-/* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
- * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
+/* int8·int8 dot product: sign trick (unsigned |w| × signed x·sign(w)). Safe:
+ * pairwise terms <= 128*127*2 = 32512 < 32767, with s32 accumulation up to I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     int32_t sum=0; int i=0;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -868,14 +870,14 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 byte/iter. Stesso trucco del
-     * segno della variante 512-bit: |w| via abs, segno piegato in x con maschera
-     * (w==0 -> product 0). __AVX2__ serve per _mm_sign_epi8 / abs. */
+    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 bytes/iter. Same sign trick as the
+     * 512-bit variant: |w| via abs, sign folded into x with a mask
+     * (w==0 -> product 0). __AVX2__ is needed for _mm_sign_epi8 / abs. */
     __m128i acc=_mm_setzero_si128();
     for(;i+16<=I;i+=16){
         __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
         __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign zona __AVX2__ */
+        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign lives in the __AVX2__ path */
         acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
     }
     sum=hsum128_i32(acc);
@@ -898,12 +900,13 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     }
     sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
-    /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
-     * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
+    /* ARM: native SDOT when available (Apple Silicon: always); otherwise vmull/vpadal.
+     * Same anti-overflow bound as the AVX2 sign trick: pairwise terms
+     * <= 128*127*2 = 32512 < 32767. */
 #if defined(__ARM_FEATURE_DOTPROD)
-    /* 4 accumulatori indipendenti: SDOT ha latenza ~3-4 cicli, con un solo acc la
-     * catena seriale strozza il core a ~26 GB/s di pesi; con 4 lane indipendenti il
-     * dot diventa memory-bound (misurato su M4: 26 -> 63 GB/s per core, 2.4x). */
+    /* 4 independent accumulators: SDOT has ~3-4 cycle latency; with a single acc the
+     * serial chain throttles the core at ~26 GB/s of weights. With 4 independent lanes
+     * the dot becomes memory-bound (measured on M4: 26 -> 63 GB/s per core, 2.4x). */
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
     for(;i+64<=I;i+=64){
         a0=vdotq_s32(a0,vld1q_s8(w+i),   vld1q_s8(x+i));
@@ -925,10 +928,10 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     sum=vaddvq_s32(acc);
 #endif
 #elif defined(__VSX__)
-    /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
-     * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
-     * Stesso trucco del segno (|w| u8 per x*sign(w) s8), ma |w| via select+sub MODULO
-     * e non vec_abs: -128 deve diventare 128 u8, non saturare a 127.
+    /* POWER8: vec_msum (s8 x u8 -> s32) accumulates byte products DIRECTLY into s32
+     * lanes, 16 bytes/iter: the 16-bit anti-saturation bound of maddubs is not needed here.
+     * Same sign trick (u8 |w| for s8 x*sign(w)), but build |w| with modulo
+     * select+sub rather than vec_abs: -128 must become 128 u8, not saturate to 127.
      * EN: vec_msum accumulates byte products straight into s32 lanes; |w| is built
      * with a modulo subtract select instead of vec_abs so w=-128 wraps to 128 (u8)
      * rather than saturating to 127. |x|<=127 from qrow_i8, so x negation is safe. */
@@ -947,7 +950,7 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
     return sum;
 }
-/* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
+/* int4(packed)·int8 dot product: convert nibble -> int8 [-8,7] on the fly, then use the same trick. */
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -971,15 +974,15 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    /* AVX-VNNI 128-bit, int4: 16 byte = 32 nibble -> int8 [-8,7] in due half
-     * (n0/n1), ciascuno alimentato a un vpdpbusd da 16 byte. Stesso unpack
-     * 128-bit del ramo AVX2 sotto; 32 elementi/iter come li. */
+    /* AVX-VNNI 128-bit, int4: 16 bytes = 32 nibbles -> int8 [-8,7] in two halves
+     * (n0/n1), each feeding one 16-byte vpdpbusd. Same 128-bit unpack
+     * as the AVX2 branch below; same 32 elements/iter. */
     const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
     __m128i acc=_mm_setzero_si128();
     for(;i+32<=I;i+=32){
-        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibble in ordine */
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibbles in memory order */
         __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
         __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
         __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
@@ -992,9 +995,9 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i acc=_mm256_setzero_si256();
     for(;i+32<=I;i+=32){
-        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in ordine */
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in memory order */
         __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
         __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
         __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
@@ -1005,9 +1008,9 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     const __m128i m4=_mm_set1_epi8(0x0F), b8=_mm_set1_epi8(8), ones=_mm_set1_epi16(1);
     __m128i acc=_mm_setzero_si128();
     for(;i+16<=I;i+=16){
-        __m128i by=_mm_loadl_epi64((const __m128i*)(w4+(i>>1)));   /* 8 byte = 16 nibble */
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w4+(i>>1)));   /* 8 bytes = 16 nibbles */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i wv=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);      /* nibble in ordine */
+        __m128i wv=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);      /* nibbles in memory order */
         __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
         __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
         acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
@@ -1016,12 +1019,12 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
 #if defined(__ARM_FEATURE_DOTPROD)
-    /* 4 accumulatori indipendenti (vedi dot_i8i8): spezza la catena seriale su acc.
-     * Misurato su M4: 12.4 -> 29.9 GB/s di pesi per core (2.4x). */
+    /* 4 independent accumulators (see dot_i8i8): breaks the serial dependency chain on acc.
+     * Measured on M4: 12.4 -> 29.9 GB/s of weights per core (2.4x). */
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
     for(;i+64<=I;i+=64){
         uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
-        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4)); /* nibble in ordine */
+        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4)); /* nibbles in memory order */
         uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q), vshrq_n_u8(byB,4));
         a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q),vld1q_s8(x+i));
         a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q),vld1q_s8(x+i+16));
@@ -1030,8 +1033,8 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     }
     int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
     for(;i+32<=I;i+=32){
-        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
-        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 bytes = 32 nibbles */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibbles in memory order */
         acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
         acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
     }
@@ -1039,12 +1042,12 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 #else
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+32<=I;i+=32){
-        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
-        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 bytes = 32 nibbles */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibbles in memory order */
         int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
         int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
         int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
-        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: no overflow */
         p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
         acc=vpadalq_s16(acc,p);
         p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
@@ -1054,18 +1057,16 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     sum=vaddvq_s32(acc);
 #endif
 #elif defined(__VSX__)
-    /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
-     * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
-     * ordine di memoria. |w|<=8 dopo il -8, quindi stesso trucco del segno di dot_i8i8.
-     * EN: vec_mergeh/l on ppc64le interleave like x86 unpacklo/hi (verified on POWER8),
-     * so nibbles come out in memory order; then the same sign trick as dot_i8i8. */
+    /* 16 bytes = 32 nibbles. vec_mergeh/vec_mergel on ppc64le (GCC) interleave like
+     * x86 unpacklo/unpackhi (verified empirically on POWER8): the nibbles come out in
+     * memory order. |w|<=8 after subtracting 8, so use the same sign trick as dot_i8i8. */
     const __vector unsigned char m4v=vec_splats((unsigned char)0x0F);
     const __vector unsigned char sh4=vec_splats((unsigned char)4);
     const __vector signed char b8v=vec_splats((signed char)8);
     const __vector signed char vz=vec_splats((signed char)0);
     __vector signed int acc=vec_splats(0);
     for(;i+32<=I;i+=32){
-        __vector unsigned char by=vec_xl(0,w4+(i>>1));               /* 16 byte = 32 nibble */
+        __vector unsigned char by=vec_xl(0,w4+(i>>1));               /* 16 bytes = 32 nibbles */
         __vector unsigned char lo=vec_and(by,m4v), hi=vec_sr(by,sh4);
         __vector signed char w0=vec_sub((__vector signed char)vec_mergeh(lo,hi),b8v);
         __vector signed char w1=vec_sub((__vector signed char)vec_mergel(lo,hi),b8v);
@@ -1084,10 +1085,10 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     return sum;
 }
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-/* SMMLA (i8mm): vmmlaq_s32 vede ogni int8x16_t come matrice 2x8 row-major (byte 0-7 =
- * riga 0, byte 8-15 = riga 1) e accumula C += A*B^T nel 2x2 int32: lane0=a0.b0,
- * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine di due mezze-righe costruisce la
- * matrice: A = due righe di peso (o,o+1), B = due righe di attivazione (s,s+1), quindi
+/* SMMLA (i8mm): vmmlaq_s32 sees each int8x16_t as a 2x8 row-major matrix (bytes 0-7 =
+ * row 0, bytes 8-15 = row 1) and accumulates C += A*B^T into a 2x2 int32 tile:
+ * lane0=a0.b0, lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine of two half-rows builds
+ * the matrix: A = two weight rows (o,o+1), B = two activation rows (s,s+1), so
  * meta' traffico pesi e doppio lavoro per istruzione a S>=2. EN: vmmlaq_s32 treats each
  * int8x16_t as a 2x8 row-major matrix and does C += A*B^T on a 2x2 int32 tile; vcombine
  * of vget_low/high halves builds the 2-row register from two weight/activation rows. */
@@ -1106,8 +1107,7 @@ static void matmul_q_idot_mm(float *y, const int8_t *xq, const float *sx, const 
         float sc0=scale[o], sc1=scale[o+1];
         for(int s=0;s<(S&~1);s+=2){
             const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
-            /* 4 accumulatori indipendenti: una sola catena vmmla e' latency-bound.
-             * EN: 4 independent accumulators; a single vmmla chain is latency-bound. */
+            /* 4 independent accumulators: a single vmmla chain is latency-bound. */
             int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
             for(;i+64<=I;i+=64){
                 a0=mm_tile16(a0,vld1q_s8(wo+i),   vld1q_s8(wo1+i),   vld1q_s8(xs+i),   vld1q_s8(xs1+i));
@@ -1145,8 +1145,7 @@ static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const
         float sc0=scale[o], sc1=scale[o+1];
         for(int s=0;s<(S&~1);s+=2){
             const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
-            /* 4 accumulatori indipendenti (vedi matmul_q_idot_mm).
-             * EN: 4 independent accumulators, see matmul_q_idot_mm. */
+            /* 4 independent accumulators, see `matmul_q_idot_mm`. */
             int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
             for(;i+64<=I;i+=64){
                 uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
@@ -1255,10 +1254,10 @@ static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
     *xq=g_qscratch.xq; *sx=g_qscratch.sx;
 }
 
-/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
- * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
- * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
- * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
+/* allow_idot=0: force the EXACT int4/int8 kernel (f32 activations). Needed for attention
+ * projections: they are sensitive to IDOT's int8 activation quantization. Measured on
+ * GLM-5.2 int4, 1023 tokens, log-lik -5040.33 (exact) -> -5160.47 (IDOT) = +0.117 nat/token,
+ * ~+12% perplexity. The other prefill matmuls (o_proj, kv_b, expert) keep IDOT.
  * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
  * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
@@ -1292,15 +1291,15 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
      * since the whole point of grouped scales is better quality). */
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
-    /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
-     * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
-     * PR #9 per il gemello VNNI). Soglia configurabile con I4S.
+    /* int8 IDOT always wins (1.4-2.5x). For int4 IDOT, the author found on AVX2 that
+     * it does not pay off at S=1 (threshold S>=2); but on ARM/SDOT the single token IS
+     * worthwhile (see g_i4s / PR #9 for the VNNI twin). Threshold configurable with I4S.
      * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
-    /* #163: sotto SPEC_PIN il gate int4-IDOT usa la decisione di S=1 per OGNI S, cosi'
-     * draft e verifica restano sulla stessa famiglia. (CUDA non e' toccato: la sua
-     * condizione non dipende da S, quindi e' gia' coerente tra draft e verifica.)
+    /* #163: under SPEC_PIN the int4-IDOT gate uses the S=1 decision for EVERY S, so
+     * draft and verify stay in the same family. (CUDA is unchanged: its condition
+     * does not depend on S, so it is already consistent between draft and verify.)
      * EN: under SPEC_PIN the int4 IDOT gate uses the S=1 decision for EVERY S, so draft
      * and verify stay in one family. (CUDA untouched: its condition is S-independent,
      * hence already draft/verify-consistent.) */
@@ -1318,7 +1317,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
-/* quantizza w[O,I] f32 -> int8 q[O,I] + scala[O] simmetrica per riga */
+/* Quantize f32 w[O,I] -> int8 q[O,I] + symmetric per-row scale[O]. */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1;
     #pragma omp parallel for schedule(static)
@@ -1329,8 +1328,8 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
         for(int i=0;i<I;i++){ int v=(int)lrintf(wr[i]/s); if(v>qmax)v=qmax; if(v<-qmax-1)v=-qmax-1; qr[i]=(int8_t)v; }
     }
 }
-/* quantizza w[O,I] f32 -> int4 impacchettato (2/byte) + scala[O].
- * bits<=4: valori in [-qmax-1,qmax] stanno in un nibble [-8,7]; memorizzati come v+8 (0..15). */
+/* Quantize f32 w[O,I] -> packed int4 (2/byte) + scale[O].
+ * bits<=4: values in [-qmax-1,qmax] fit in a nibble [-8,7], stored as v+8 (0..15). */
 static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1, rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
@@ -1346,7 +1345,7 @@ static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, i
     }
 }
 
-/* quantizza w[O,I] f32 -> int2 impacchettato (4/byte) + scala[O]. valori nibble 2-bit in [-2,1]. */
+/* Quantize f32 w[O,I] -> packed int2 (4/byte) + scale[O]. 2-bit nibble values in [-2,1]. */
 static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1, rb=(I+3)/4;
     #pragma omp parallel for schedule(static)
@@ -1361,21 +1360,21 @@ static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, i
     }
 }
 
-static int g_nopack=0;   /* NOPACK=1 -> tiene i valori <=4bit in contenitore int8 (per validare il packing) */
-static int g_drop=0;     /* DROP=1 -> scarta le pagine expart dopo l'uso. Default 0: le lascia in
-                          * page-cache (buff/cache, NON RSS) come L2 gratuito -> sfrutta lo
-                          * sbilanciamento del routing MoE (pochi expert "caldi" riusati). */
-static int g_prefetch=0; /* PREFETCH=1 -> riabilita il WILLNEED cross-layer (metodo C). Default
-                          * OFF: i load VERI in parallelo lo hanno reso superfluo, e sotto
-                          * pressione di memoria il readahead speculativo veniva rievictato. */
-static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF: su questo host
-                          * (VHDX su NVMe DRAM-less, latenza serializzata ~60ms/req) il buffered
-                          * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
-static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/testo,
-                          * 0=greedy in validazione). 0 = greedy puro. */
-static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
-static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
-static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static int g_nopack=0;   /* NOPACK=1 -> keep <=4-bit values in an int8 container (to validate packing) */
+static int g_drop=0;     /* DROP=1 -> discard expert pages after use. Default 0: keep them in the
+                          * page cache (buff/cache, NOT RSS) as a free L2 -> exploit the
+                          * skew of MoE routing (a few "hot" experts reused often). */
+static int g_prefetch=0; /* PREFETCH=1 -> re-enable cross-layer WILLNEED (method C). Default
+                          * OFF: real parallel loads made it unnecessary, and under memory
+                          * pressure the speculative readahead was simply evicted again. */
+static int g_direct=0;   /* DIRECT=1 -> O_DIRECT on expert slabs. Default OFF: on this host
+                          * (VHDX on DRAM-less NVMe, serialized latency ~60ms/request) smooth
+                          * buffered I/O measured best; on real NVMe, DIRECT=1 performs better. */
+static float g_temp=-1;  /* TEMP: sampling temperature on TOKENS. <0 = auto (1.0 in chat/text,
+                          * 0=greedy in validation). 0 = pure greedy. */
+static float g_nuc=0.95f;/* NUCLEUS: top-p over the vocabulary (default from GLM-5.2 generation_config) */
+static int g_topk=0;     /* TOPK=n -> use n experts/token instead of config (research: less disk I/O) */
+static float g_topp=0;   /* TOPP=p (0..1) -> adaptive top-p: keep experts up to cumulative weight p */
 static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded per layer across the
                                * batch-union. Reduces disk I/O on cold/low-RAM hosts by dropping the
                                * lowest-gate-weight experts from the cross-position union. MoE-Spec
@@ -1390,23 +1389,23 @@ static float g_route_p=0;    /* ROUTE_P: if >0, choose M from cumulative router 
 static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE substitutes before renorm (1=off) */
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
-static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
-static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
-                          * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
-                          * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
-                          * rifiutato paga comunque i suoi expert dal disco = ~3x piu' lento.
-                          * Opt-in (DRAFT=4) per testi ripetitivi dove l'acceptance e' alta. */
-/* metodo F (#48): GRAMMAR=<file.gbnf> -> terza sorgente di draft, la grammatica stessa.
- * Nei workload a output vincolato (JSON/NDJSON, function calling) i byte FORZATI dalla
- * grammatica (chiavi, punteggiatura, valori enum) sono draft gratuiti ad acceptance ~1:
- * nessuna testa, nessuna lookup table, e si aggancia anche dove la testa MTP int4 non
- * parte (#8). MAI un vincolo sul sampling: solo proposte, la verifica batch-union
- * decide — grammatica sbagliata = draft rifiutati, output identico.
- * GRAMMAR_DRAFT=n (default 24) limita i token forzati per forward. */
+static int g_spec=1;     /* method C: SPEC=0 disables speculative cross-layer prefetch */
+static int g_draft=0;    /* method E: DRAFT=n tokens auto-drafted per forward via n-gram lookup
+                          * (0=off). LOSSLESS: verification = output identical to greedy. Default OFF:
+                          * measured on the real run (2026-07-03), acceptance was ~5% -> every
+                          * rejected draft still pays for its experts from disk = ~3x slower.
+                          * Opt-in (DRAFT=4) for repetitive text where acceptance is high. */
+/* method F (#48): GRAMMAR=<file.gbnf> -> third draft source, the grammar itself.
+ * In constrained-output workloads (JSON/NDJSON, function calling), bytes FORCED by
+ * the grammar (keys, punctuation, enum values) are free drafts with acceptance ~1:
+ * no head, no lookup table, and it also helps where the int4 MTP head does not
+ * engage (#8). NEVER a sampling constraint: only proposals, batch-union verification
+ * decides — wrong grammar = rejected drafts, identical output.
+ * GRAMMAR_DRAFT=n (default 24) limits forced tokens per forward. */
 static Grammar g_gram; static GrState g_gst;
 static Tok *g_gr_T=NULL;
-static int g_gr_on=0;     /* grammatica caricata e walker vivo */
-static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
+static int g_gr_on=0;     /* grammar loaded and walker alive */
+static int g_gr_armed=0;  /* lazy: start from the first byte allowed by the root (skip preambles) */
 static int g_gr_max=24;
 static uint64_t g_gr_prop=0, g_gr_acc=0;
 static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
@@ -1429,23 +1428,23 @@ static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (
 static float   *cp_cnt=NULL;
 static long g_cp_enq=0;
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke);
-static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quanto il routing MoE
-                          * e' predicibile IN ANTICIPO — la domanda che decide se un prefetch
-                          * pilotato dal router puo' riempire i tempi morti del disco.
-                          * [0] token precedente, stesso layer (cio' che usa gia' SPEC/PREFETCH)
-                          * [1] ingresso del layer -> routing dello STESSO layer (salta l'attention)
-                          * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
-                          *     un'attention di anticipo: il punto dove il prefetch avrebbe
-                          *     un intero giro di disco per lavorare in ombra). */
+static int g_looka=0;    /* LOOKA=1: measure (counters only, zero effects) how predictable MoE routing
+                          * is IN ADVANCE — the question that decides whether router-driven
+                          * prefetch can fill the disk's idle gaps.
+                          * [0] previous token, same layer (what SPEC/PREFETCH already uses)
+                          * [1] layer input -> routing of the SAME layer (skip attention)
+                          * [2] post-attention of layer L -> routing of L+1 (one MoE residual and
+                          *     one attention step ahead: the point where prefetch would have
+                          *     a whole disk rotation to work under the compute shadow). */
 static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]=two-step */
 static int la_pred[3][130][16]; static signed char la_val[3][130];
-static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
-static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
-static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (miss LRU) in
-                          * draft MTP / absorb / verify-main e in layer MTP (int8) vs main
-                          * (int4), con i byte letti. Default OFF: a flag spento gli atomic
-                          * non vengono MAI toccati (zero overhead), le righe extra di stats
-                          * non vengono stampate. Solo misura: nessun effetto sull'output. */
+static int g_pilot=0;    /* PILOT=1: router-driven prefetch (see pilot_prefetch) */
+static int g_pilot_k=8;  /* PILOT_K=k: prefetch only the top k predictions per position */
+static int g_disk_split=0; /* DISK_SPLIT=1: counters that split DISK LOADs (LRU misses) into
+                          * MTP draft / absorb / verify-main and into MTP layer (int8) vs main
+                          * (int4), including bytes read. Default OFF: with the flag off the atomics
+                          * are NEVER touched (zero overhead), and the extra stats lines are
+                          * not printed. Measurement only: no effect on output. */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
  * GPU reads them zero-copy (no upload duplicate). Plain malloc otherwise. */
 /* ---- COLI_NUMA=1 (#82): interleave the expert slabs across NUMA nodes ----
@@ -1514,29 +1513,29 @@ static void *qalloc(size_t n){
     return p;
 }
 static float *qsalloc(int O){ return (float*)qalloc((size_t)O*sizeof(float)); }
-static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer dentro ecache[L+1]
-                          * (non il semplice WILLNEED). Implica PILOT=1. Default OFF: hint-only. */
+static int g_pilot_real=0;/* PILOT_REAL=1: the pilot performs REAL cross-layer loads into ecache[L+1]
+                          * (not just WILLNEED). Implies PILOT=1. Default OFF: hint-only. */
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
-/* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
- *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
- *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
- *     aspetta l'eventuale load in volo su QUEL layer. Quindi NESSUNO slot mezzo-caricato viene
- *     mai matmul-ato: il matmul e il pilota non toccano mai lo stesso layer contemporaneamente.
- *  2) Percorso SCAN (pilot_prefetch, anch'esso sul MAIN): la scansione di residenza gira sul
- *     layer FUTURO (lnext = layer corrente + 1), esattamente il layer che il pilota sta scrivendo
- *     -> QUI i due thread toccano davvero la stessa ecache. Percio' quella scansione prende
- *     g_pilot_mx (lo stesso lock del worker): letture e pubblicazione degli slot sono serializzate,
- *     niente torn read di ecn[]/eid. Il pilota non altera MAI il valore di un expert, solo QUALE
- *     expert e' residente: con un load andato a buon fine l'output resta byte-identico all'OFF. */
+/* main<->pilot handshake for real cross-layer loads. Safety invariant in TWO parts:
+ *  1) MATMUL path (moe): the pilot writes ONLY ecache[layer] for layers > g_cur_moe_layer;
+ *     moe() matmul reads ONLY ecache[layer]==g_cur_moe_layer, and the barrier at moe() entry
+ *     waits for any in-flight load on THAT layer. So NO half-loaded slot is ever used in a
+ *     matmul: the matmul and the pilot never touch the same layer at the same time.
+ *  2) SCAN path (pilot_prefetch, also on MAIN): the residency scan runs on the FUTURE
+ *     layer (lnext = current layer + 1), exactly the layer the pilot is writing
+ *     -> HERE the two threads really do touch the same ecache. So that scan takes
+ *     g_pilot_mx (the worker's same lock): reads and slot publication are serialized,
+ *     with no torn reads of ecn[]/eid. The pilot NEVER changes an expert's value, only WHICH
+ *     expert is resident: when the load succeeds the output stays byte-identical to OFF. */
 static pthread_mutex_t g_pilot_mx=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pilot_cv=PTHREAD_COND_INITIALIZER;
-static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' entrato (per forward) */
+static _Atomic int g_cur_moe_layer=-1;   /* highest MoE layer MAIN has entered (for the current forward) */
 static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
-static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
-static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
-/* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
+static _Atomic long g_pilot_loads=0;     /* completed REAL cross-layer loads (bandwidth spent) */
+static _Atomic long g_pilot_drops=0;     /* predictions dropped because MAIN already owns the layer */
+/* choose the storage format from `bits`: >=16 f32, 5..8 int8, <=4 packed int4 */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
@@ -1574,7 +1573,7 @@ static void rmsnorm(float *out, const float *x, const float *w, int D, float eps
 #endif
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
-/* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
+/* Classic LayerNorm (mean+variance, weight+bias) — used by the DSA indexer's k_norm */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
     double mu=0; for(int i=0;i<n;i++) mu+=v[i]; mu/=n;
     double var=0; for(int i=0;i<n;i++){ double d=v[i]-mu; var+=d*d; } var/=n;
@@ -1585,9 +1584,9 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
-
-/* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static int g_no_rope_inv_cache=0;   /* COLI_NO_ROPE_INV_CACHE=1: A/B the per-qk/theta inverse-frequency cache */
+
+/* Interleaved RoPE on a qk_rope-sized vector at position pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
     int half = c->qk_rope/2;
     /* Validate against the fixed buffers (in[256], cache cs/sn[128] -> qk_rope<=256).
@@ -1645,23 +1644,21 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
-    /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
-     * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
+    /* Stop tokens: GLM-5.2 has THREE (endoftext, user, observation). Stopping on only
+     * the first one generates invisible garbage after the turn ends (5-10x wasted tokens). */
     c->n_stop=0;
     jval *eo=json_get(r,"eos_token_id");
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
                 c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
-    /* generation_config.json e' il file AUTOREVOLE per la generazione secondo HuggingFace:
-     * config.json ne porta spesso una copia legacy o parziale. Un tool di conversione che
-     * rigenera un config.json ridotto lascia il motore fermo su MENO stop del dovuto, e i
-     * token di controllo che restano finiscono stampati in chat come testo (woolcoxm, #298:
-     * "the stop token being printed to chat", verificato sui token id). Unione dei due:
-     * uno stop in piu' non fa danno, uno in meno si' -- e chi converte i pesi non siamo noi.
-     * EN: generation_config.json is HF's authority for generation; config.json often carries
-     * a partial legacy copy. Union both -- an extra stop is harmless, a missing one is not. */
+    /* generation_config.json is HuggingFace's authoritative generation file:
+     * config.json often carries only a legacy or partial copy. A conversion tool that
+     * regenerates a reduced config.json can leave the engine with FEWER stop tokens than
+     * required, and leftover control tokens then get printed into chat as text (woolcoxm, #298:
+     * "the stop token being printed to chat", verified on the token ids). So union both:
+     * one extra stop is harmless, one missing stop is not, and we are not the weight converter. */
     { char gp[2100]; snprintf(gp,sizeof(gp),"%s/generation_config.json",snap);
-      FILE *gf=fopen(gp,"rb");                  /* assente = nessun problema: e' opzionale */
+      FILE *gf=fopen(gp,"rb");                  /* absent is fine: this file is optional */
       if(gf){
         fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
         if(gn>0){
@@ -1681,7 +1678,7 @@ static void load_cfg(Cfg *c, const char *snap){
         }
         fclose(gf);
       } }
-    /* DSA lightning indexer: parametri + tipo per-layer (lista esplicita o formula freq/offset) */
+    /* DSA lightning indexer: parameters + per-layer type (explicit list or freq/offset formula) */
     c->index_topk=gi(r,"index_topk"); c->index_nh=gi(r,"index_n_heads"); c->index_hd=gi(r,"index_head_dim");
     { jval *it=json_get(r,"indexer_types");
       int freq=gi(r,"index_topk_freq"); if(freq<1) freq=1;
@@ -1694,8 +1691,8 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
-    /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
-     * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
+    /* VALIDATION (PR #25 report): config.json may come from untrusted mirrors — hostile
+     * dimensions must not get past this point. One choke point protects every downstream alloc. */
     #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
         fprintf(stderr,"config: %s=%d is outside [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
     CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
@@ -1734,9 +1731,11 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
-/* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
- *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
- *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
+/* Build a QT [O,I] from disk into `t` (buffers reusable across calls).
+ *  - if `name.qs` exists: weights are ALREADY quantized in the container
+ *    (U8 qdata + F32 scale) -> read directly
+ *  - otherwise: full tensor (f32/bf16) -> quantize at runtime to `bits`
+ *    (tiny oracle / full-precision weights)
  * drop=1 -> fadvise DONTNEED (streaming expert). */
 static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int drop, QT *t){
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
@@ -1772,9 +1771,9 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 #endif
     return t;
 }
-static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
+static float *ld(Model *m, const char *name){   /* resident 1D f32 tensor (norms/biases) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
-    float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
+    float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registered for the GPU under METAL */
     st_read_f32(&m->S,name,p,0); return p;
 }
 #ifdef COLI_CUDA
@@ -1809,14 +1808,15 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
-    /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
-     * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
+    /* embed and lm_head sit on the I/O boundary: keep them at high precision, like
+     * real dynamic quantization does. In bf16 this is ~1.9 GB on real GLM: negligible.
+     * dbits>=8 -> use f32 here; lower -> use dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
     m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
     m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
     m->final_norm = ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
-    int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
+    int NR=c->n_layers+1;                        /* +1: row for the MTP layer */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
@@ -1841,7 +1841,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
-        qt_cuda_colocate(&l->q_b,&l->kv_b);   /* stessa scheda / whole attention chain */
+        qt_cuda_colocate(&l->q_b,&l->kv_b);   /* same device / whole attention chain */
         qt_cuda_colocate(&l->kv_a,&l->kv_b);  /* on the layer home device */
         if(getenv("COLI_CUDA_ATTN_SHARD")&&atoi(getenv("COLI_CUDA_ATTN_SHARD")))
             layer_cuda_shard_kvb(l,H,c->qk_nope,c->v_head);
@@ -1864,17 +1864,17 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             qt_cuda_colocate(&l->sh_down,&l->sh_gate);
 #endif
             m->ecache[i]=calloc(cap,sizeof(ESlot));
-            m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
+            m->eroute[i]=calloc(c->topk,sizeof(int));      /* method C: last routing of the layer */
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
         }
         #undef P
     }
-    /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
+    /* MTP head (layer n_layers): present only when converted with --mtp */
     {
-        /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
-         * conversione parziale ne esiste solo una parte). MTP=0 la disabilita comunque. */
+        /* MTP becomes active ONLY if the set is COMPLETE (the tensors live on 3 shards:
+         * during partial conversion only part of them exists). MTP=0 still disables it. */
         const char *req[]={"eh_proj.weight","enorm.weight","hnorm.weight","shared_head.norm.weight",
             "input_layernorm.weight","post_attention_layernorm.weight",
             "self_attn.q_a_proj.weight","self_attn.q_b_proj.weight","self_attn.kv_a_proj_with_mqa.weight",
@@ -1914,12 +1914,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->elast[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
+            m->kv_start[i]=-1;                    /* MTP KV: starts from the first decode position */
             #undef PM
         }
     }
-    /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
-     * TUTTI i layer full. Auto-rilevamento come per MTP: niente flag, niente passi extra. */
+    /* DSA lightning indexer: active ONLY if the weights (conversion with --indexer)
+     * exist for ALL full layers. Auto-detected like MTP: no flag, no extra steps. */
     {
         m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
         char inm[300];
@@ -1948,7 +1948,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     }
     m->hlast=falloc(D); m->h_all=falloc((int64_t)512*D);
 
-    /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
+    /* resident bytes of the DENSE part (embed+lm_head+attn+dense mlp+shared+norms) */
     int64_t rb=qt_bytes(&m->embed)+qt_bytes(&m->lm_head);
     for(int i=0;i<c->n_layers;i++){ Layer *l=&m->L[i];
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
@@ -1964,7 +1964,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->resident_bytes=rb;
 }
 
-/* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
+/* embed: dequantize the token row (per-row scale) into x[hidden] */
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
@@ -1978,20 +1978,20 @@ static void embed_row(Model *m, int tok, float *x){
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
-/* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
- * niente slab, niente copia: la page cache del kernel E' la cache). Le mappe sono
- * registrate con Metal (newBufferWithBytesNoCopy su pagine file-backed, come llama.cpp),
- * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento. */
+/* COLI_MMAP=1: experts become VIEWS into mmap'd safetensors files (no pread,
+ * no slab, no copy: the kernel page cache IS the cache). The mappings are
+ * registered with Metal (newBufferWithBytesNoCopy on file-backed pages, like llama.cpp),
+ * so the GPU reads the same bytes. Fallback to the slab path on misalignment. */
 static int g_mmap=0;
 static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
-static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
+static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load runs OMP-parallel */
 /* forward decls: mem_should_wire/mem_wire live near pin_wire() further down, but
  * qt_wire_mmap() (also further down, used by pin_wire()'s COLI_MMAP path) needs
  * them declared before its own definition. Real mlock-ing of mmap'd pinned
  * experts happens there, not in expert_load() -- see qt_wire_mmap() for why. */
 static int mem_should_wire(void);
 static int mem_wire(void *addr, size_t len);
-static void qt_unwire_mmap(QT *t);   /* def. presso pin_wire / defined near pin_wire */
+static void qt_unwire_mmap(QT *t);   /* definition near pin_wire */
 static int64_t g_mmap_wired=0; static long g_mmap_wire_failed=0;
 static void *map_of_fd(int fd){
     pthread_mutex_lock(&g_map_mtx);
@@ -2014,21 +2014,21 @@ static void *map_of_fd(int fd){
     return base;
 }
 
-/* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
- * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
- * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
- * THREAD-SAFE su slot distinti (pread posizionale, st_find read-only). */
+/* Load one expert into the slot. In the pre-quantized container the 3 matrices are
+ * contiguous in the file -> ONE coalesced ~19 MB pread into `slab` (+ the scales in
+ * fslab); the QTs are views into the slab (zero copies). Fallback for non-quantized
+ * models (tiny oracle). THREAD-SAFE across distinct slots (positional pread, read-only st_find). */
 /* Load one expert's weights into slot `s`. Returns 0 on success, -1 on failure.
  * fatal=1 (all main / on-demand / REPIN / pin callers): preserve the original
  * exit-on-error contract byte-for-byte — any missing tensor, OOM, short read or
  * pread error aborts the process. fatal=0 (speculative pilot only): the same
  * errors instead abandon the load and return -1 without touching s->eid, so a
  * mispredicted cross-layer prefetch can never kill the server. */
-/* pread completo: gestisce le short-read (POSIX le ammette su file regolari
- * sotto pressione di memoria) e le EINTR, e riporta un errore ONESTO. perror
- * stampava "Success" quando pread ritorna un conteggio corto invece di -1
- * (errno resta 0 dalla syscall precedente) -> messaggio fuorviante nel path
- * score/bench (#236). Ritorna 0 = ok, -1 = errore reale o EOF. */
+/* Full pread: handles short reads (POSIX allows them on regular files under
+ * memory pressure) and EINTR, and reports an HONEST error. perror used to print
+ * "Success" when pread returned a short count instead of -1
+ * (errno stayed 0 from the previous syscall) -> misleading message in the
+ * score/bench path (#236). Returns 0 = ok, -1 = real error or EOF. */
 static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag){
     char *p=buf; int64_t got=0;
     while(got<n){
@@ -2128,8 +2128,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
-    /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
-     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
+    /* reallocate if the slot (reused across layers) is too small for THIS expert:
+     * pread past the mapping = short read or silent CORRUPTION of adjacent memory */
     if(!s->slab || wtot+8192 > s->slab_cap){
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
@@ -2212,8 +2212,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
-    if(g_drop){                                  /* scarta subito le pagine: evita che la page
-                                                  * cache in pressione strangoli il throughput */
+    if(g_drop){                                  /* drop the pages immediately: prevents a pressured
+                                                  * page cache from strangling throughput */
         posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
         for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd, tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
     }
@@ -2565,8 +2565,8 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 }
 #endif
 
-/* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
- * cosi' le letture sincrone successive trovano la page-cache calda. */
+/* Async prefetch of an expert's weights (and its .qs scales): start readahead
+ * so the later synchronous reads hit a warm page cache. */
 static void expert_prefetch(Model *m, int layer, int eid){
     char nm[300];
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
@@ -2576,14 +2576,15 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
-/* ---- helper per l'ABSORPTION: accesso per-riga ai QT quantizzati ---- */
-/* acc[0..I) += coef * W[row,:] (dequant al volo) */
+/* ---- ABSORPTION helpers: per-row access to quantized QTs ---- */
+/* acc[0..I) += coef * W[row,:] (dequantize on the fly) */
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
-    /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
-     * sbagliata. Senza questo ramo il fall-through int2 decodificava i nibble int4 come
-     * coppie di valori a 2 bit — lo stesso bug di #298 sui kernel absorb CUDA, lato CPU.
+    /* fmt=4 BEFORE computing c: s[] is [O,ng] per-group, so s[row] would be the wrong
+     * scale. Without this branch the int2 fall-through decoded int4 nibbles as
+     * pairs of 2-bit values — the same bug as #298 in the CUDA absorb kernels,
+     * on the CPU side.
      * EN: fmt=4 BEFORE computing c: s[] is [O,ng] per-group, s[row] would be the wrong
      * scale. Without this branch the int2 fall-through decoded int4 nibbles as pairs of
      * 2-bit values — the same bug #298 fixed in the CUDA absorb kernels, CPU side. */
@@ -2601,7 +2602,7 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
     const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
     for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
 }
-/* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
+/* y[0..n) = W[r0+j,:]·x  (matvec over a SLICE of QT rows) */
 static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
     int I=t->I;
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
@@ -2623,11 +2624,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         y[j]=(float)a;
     }
 }
+
 static int g_absorb=-1;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
-static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
+static int g_dsa_force=0; /* DSA_FORCE=1: selection always active (test: top-min(k,T)=dense) */
 static int cmp_fdesc(const void *a,const void *b){
     float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
 
@@ -2668,13 +2670,13 @@ static void partial_select_desc(float *a, int n, int k){
     }
 }
 
-/* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
+/* MLA attention with compressed KV-cache, on new tokens x[S,hidden], pos_base = first token position */
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
 #ifdef COLI_CUDA
-/* Ombra KV su device per il DECODE: righe [0,upto) valide sulla scheda di kv_b.
- * L'host resta canonico; l'ombra si riallinea in blocco quando resta indietro e
- * viene invalidata da kv_bind / dalla riscrittura di righe gia' specchiate. */
+/* KV shadow on device for DECODE: rows [0,upto) are valid on kv_b's device.
+ * Host memory stays canonical; the shadow is resynced in bulk when it falls behind,
+ * and invalidated by kv_bind / by overwriting rows that were already mirrored. */
 static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
     if(upto>m->max_t) return 0;
@@ -2696,10 +2698,10 @@ static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
 }
 
 /* Inc.1a — catena attention residente sul device del layer / attention chain
- * resident on the layer home device. Proiezioni q/kv, norme, RoPE, batch
- * attention e o_proj girano sulla scheda di kv_b; scaricano solo out [S,D],
- * i nuovi record KV [S,kvl+R] e nulla altro. Ritorna 0 su qualsiasi errore:
- * il chiamante riesegue il percorso CPU (idempotente). */
+ * resident on the layer home device. q/kv projections, norms, RoPE, batch
+ * attention, and o_proj all run on kv_b's device; they download only out [S,D],
+ * the new KV records [S,kvl+R], and nothing else. Returns 0 on any error:
+ * the caller reruns the CPU path (idempotent). */
 static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int x_is_dev,
                              int S, int pos_base, float *out, float *out_dev){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head;
@@ -2725,7 +2727,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if((!x_is_dev&&!coli_cuda_pipe_upload(dev,xd,x,xb))||
        !coli_cuda_pipe_upload(dev,w1,l->q_a_ln,(size_t)ql*4)||
        !coli_cuda_pipe_upload(dev,w2,l->kv_a_ln,(size_t)kvl*4)) goto done;
-    /* proiezioni + norme + rope, tutto sul device */
+    /* projections + norms + rope, all on device */
     if(!coli_cuda_pipe_gemm(l->q_a.cuda,qrd,xd,S)) goto done;
     if(!coli_cuda_pipe_rmsnorm(dev,qrd,qrd,w1,S,ql,c->eps)) goto done;
     if(!coli_cuda_pipe_gemm(l->q_b.cuda,qd,qrd,S)) goto done;
@@ -2733,14 +2735,14 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(!coli_cuda_pipe_gemm(l->kv_a.cuda,cd,xd,S)) goto done;
     if(!coli_cuda_pipe_rmsnorm_s(dev,cd,cd,w2,S,kvl,c->eps,kvl+R,kvl+R)) goto done;
     if(!coli_cuda_pipe_rope_base(dev,cd,pos_base,S,kvl+R,kvl,R,1,c->theta)) goto done;
-    /* cache latente [T,kvl] + rot [T,R] contigue: righe vecchie da host, nuove da cd */
+    /* contiguous latent cache [T,kvl] + rot [T,R]: old rows from host, new ones from cd */
     if(old>0){
         if(!coli_cuda_pipe_upload(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl*4)||
            !coli_cuda_pipe_upload(dev,rd,coli_kv_row(m->Rc[layer],st0,R),(size_t)old*R*4)) goto done;
     }
     if(!coli_cuda_pipe_copy2d(dev,ld_+(size_t)old*kvl,kvl,cd,kvl+R,kvl,S)) goto done;
     if(!coli_cuda_pipe_copy2d(dev,rd+(size_t)old*R,R,cd+kvl,kvl+R,R,S)) goto done;
-    /* KV host resta canonica: scarica i record nuovi (gia' normati+ropati) */
+    /* host KV stays canonical: download the new records (already normalized + roped) */
     if(!coli_cuda_pipe_download(dev,cd,chost,cb)) goto done;
     for(int s=0;s<S;s++){
         memcpy(coli_kv_row(m->Lc[layer],pos_base+s,kvl),chost+(size_t)s*(kvl+R),kvl*4);
@@ -2753,10 +2755,10 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * sul suo link PCIe — attention 26->41-44s. Resta opt-in per topologie NVLink. */
     if(out_dev && l->n_kv_b_shard>1 &&
        getenv("COLI_CUDA_PIPE_SHARD") && atoi(getenv("COLI_CUDA_PIPE_SHARD"))){
-        /* head-shard nel pipeline: q gia' sul device di casa. Per ogni scheda:
-         * slice di q (repack strided->contiguo), broadcast latent+rope via P2P,
-         * score parallelo sui rispettivi head, ctx slice riportata a casa e
-         * ricomposta, poi o_proj residente. */
+        /* head-shard in the pipeline: q is already on the home device. For each card:
+         * take a q slice (repack strided->contiguous), broadcast latent+rope via P2P,
+         * score its heads in parallel, copy the ctx slice back home and reassemble it,
+         * then run resident o_proj. */
         int n=l->n_kv_b_shard, vh=c->v_head;
         size_t ctxb=(size_t)S*H*vh*4;
         size_t stage_one=(size_t)S*H*(size_t)(c->qk_head>vh?c->qk_head:vh)*4;
@@ -2801,7 +2803,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
     m->t_acore+=now_s()-t0;
 done:
-    free(chost);                              /* gli scratch device restano al contesto */
+    free(chost);                              /* device scratch buffers stay with the context */
     return ok;
 }
 #endif
@@ -2845,19 +2847,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     }
 #endif
     float *ctx=falloc((int64_t)S*H*vh);
-    float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
+    float *Q=falloc((int64_t)S*H*qh);                  /* roped query of the new tokens */
     int cw=c->kv_lora+c->qk_rope;
     float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc((int64_t)S*cw);
-    /* 1) query roped + latente normato e k_rot roped -> in cache.
-     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA.
+    /* 1) roped query + normalized latent and roped k_rot -> into cache.
+     * QR keeps the q_a residual for ALL positions: the DSA indexer needs it too.
      *
-     * BATCH-ROWS: le tre proiezioni girano su tutte le S righe in un colpo solo, come gia' fa
-     * o_proj (matmul_qt(...,S) sotto) e come fa moe() con la batch-union. Una riga per volta
-     * il peso veniva ri-letto per OGNI token; a S righe si legge una volta sola.
-     * matmul_qt_ex(...,0): restano sul kernel int4 ESATTO. Con l'IDOT (che il gate S>=g_i4s
-     * abiliterebbe da solo appena S>1) il prefill sarebbe molto piu' veloce ma la qualita'
-     * cala: -5040.33 -> -5158.68 di log-lik su 1023 token (~+12% perplexity). Il batch da
-     * solo e' bit-identical all'originale; il kernel no. Vedi issue.
+     * BATCH-ROWS: the three projections run over all S rows at once, like o_proj
+     * (matmul_qt(...,S) below) and moe()'s batch-union do. One row at a time,
+     * the weight was being re-read for EVERY token; with S rows it is read once.
+     * matmul_qt_ex(...,0): keep them on the EXACT int4 kernel. With IDOT (which the S>=g_i4s
+     * gate would enable automatically as soon as S>1) prefill would be much faster but quality
+     * drops: -5040.33 -> -5158.68 log-likelihood on 1023 tokens (~+12% perplexity). Batching
+     * alone is bit-identical to the original; the kernel switch is not. See the issue.
      * EN: batch the three projections over all S rows, like o_proj below and moe()'s
      * batch-union. matmul_qt_ex(...,0) keeps them on the EXACT int4 kernel: letting S>1 pull
      * them into IDOT is much faster but costs ~12% perplexity (measured). Batching alone is
@@ -2875,7 +2877,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if(!pipe_done){
         matmul_qt_ex(QR, x, &l->q_a, S, 0);
         for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
-            rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */
+            rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b reads the NORMALIZED residual */
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     }
@@ -2889,25 +2891,25 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
 #ifdef COLI_CUDA
         if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
-            m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
+            m->kv_dev_valid[layer]=pos;              /* row overwritten: the shadow shrinks */
 #endif
         memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
-        rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+        rope_interleave(Rdst, pos, c);                            /* roped k_rot, shared across heads */
     }
     /* ---- DSA lightning indexer ----
-     * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
-     * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
-     * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
+     * FULL layer: cache k_idx for the new tokens + top-k selection per query (reused
+     * by later SHARED layers). Selection is active only when context > index_topk
+     * (or DSA_FORCE=1 for testing: selecting EVERYTHING must reproduce the exact dense output). */
     const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
     if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
-            /* BATCH-ROWS, come le proiezioni di attenzione sopra: ix_wk (D x index_hd) veniva
-             * ri-letto per OGNI token. matmul_qt_ex(...,0) lo tiene sul kernel int4 ESATTO:
-             * il batch da solo supererebbe il gate S>=g_i4s e cambierebbe la quantizzazione
-             * delle attivazioni. Cosi' l'output resta bit-identical.
+            /* BATCH-ROWS, like the attention projections above: ix_wk (D x index_hd) was
+             * being re-read for EVERY token. matmul_qt_ex(...,0) keeps it on the EXACT int4
+             * kernel: batching alone would cross the S>=g_i4s gate and change activation
+             * quantization. This keeps the output bit-identical.
              * EN: batch ix_wk over all S rows like the attention projections; allow_idot=0
              * keeps it on the exact int4 kernel so the result stays bit-identical. */
             float *KD=falloc((int64_t)S*hd);
@@ -2918,7 +2920,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
                 memcpy(kd, KD+(int64_t)s*hd, (size_t)hd*sizeof(float));
                 layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, 1e-6f);
-                rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
+                rope_interleave(kd, pos, c);                 /* first qk_rope dims, interleaved */
             }
             free(KD);
             if((int64_t)S*dtopk > m->dsa_scap){
@@ -2946,15 +2948,15 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     float a=0;
                     for(int h=0;h<nh;h++){ const float *qhp=qi+(int64_t)h*hd;
                         float d0=0; for(int i=0;i<hd;i++) d0+=qhp[i]*kt[i];
-                        d0*=rs; if(d0>0) a+=w32[h]*d0;       /* ReLU sullo score, poi peso */
+                        d0*=rs; if(d0>0) a+=w32[h]*d0;       /* ReLU on the score, then weight */
                     }
                     isc[t]=a*wsc;
                 }
-                /* top-keep: threshold via PARTIAL SELECT (#356), poi scan in ordine di posizione.
-                 * Era un qsort completo su nk (O(nk log nk)); quickselect estrae solo il
-                 * keep-esimo valore piu' grande in O(nk) medio. La soglia (= min del blocco
-                 * dei keep maggiori) e' identica a tmp[keep-1] del vecchio qsort, quindi i
-                 * due scan qui sotto costruiscono dst[] bit-identical. */
+                /* top-keep: threshold via PARTIAL SELECT (#356), then scan in position order.
+                 * This used to be a full qsort on nk (O(nk log nk)); quickselect extracts only
+                 * the keep-th largest value in average O(nk). The threshold (= min of the kept
+                 * block) is identical to tmp[keep-1] from the old qsort, so the two scans below
+                 * build dst[] bit-identically. */
                 float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
                 partial_select_desc(tmp,nk,keep);
                 float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
@@ -2967,8 +2969,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
     }
-    /* WEIGHT ABSORPTION (DeepSeek): per S piccoli (decode/verifica MTP) NON si ricostruisce
-     * k/v per ogni token del contesto. Per linearita':
+    /* WEIGHT ABSORPTION (DeepSeek): for small S (decode / MTP verify) we do NOT reconstruct
+     * k/v for every context token. By linearity:
      *   q·k_nope_t = (W_K^hT q_nope)·L_t      ctx^h = W_V^h (Σ_t a_t L_t)
      * costo per step ~O(T·kv_lora) invece di O(T·H·(nope+vh)) del matmul kvb_all. */
     if(pipe_done){
@@ -2984,18 +2986,18 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int absorb = kvs || g_absorb==1 || (g_absorb<0 && S<=4) || cuda_absorb;
     if(absorb && c->kv_lora<=512){
         m->t_aproj+=now_s()-ta0; double tac=now_s();
-        int kvl=c->kv_lora, r0v=c->qk_nope;      /* offset righe V dentro il blocco di testa */
-        /* Punteggi per-thread sul HEAP. Il cap DEVE essere il massimo nt effettivo del
-         * batch, non Tk+1: Tk=pos_base+S vale solo quando pos==pos_base+s. Il percorso
-         * batched (step_decode_batch da run_serve_mux) passa positions[] e kv_start
-         * per-slot, quindi nt=pos+1-st0 puo' superare Tk+1 -> heap-buffer-overflow su
-         * sc[jj]. Si conta esattamente come il loop sotto. */
+        int kvl=c->kv_lora, r0v=c->qk_nope;      /* V-row offset inside the head block */
+        /* Per-thread scores on the HEAP. The cap MUST be the true max nt across the
+         * batch, not Tk+1: Tk=pos_base+S is valid only when pos==pos_base+s. The batched
+         * path (step_decode_batch from run_serve_mux) passes per-slot positions[] and
+         * kv_start, so nt=pos+1-st0 can exceed Tk+1 -> heap-buffer-overflow on sc[jj].
+         * Count it exactly as the loop below does. */
         int64_t sc_cap = 1;
         for(int s=0;s<S;s++){
             KVState *ks=kvs?kvs[s]:m->kv;
             int pos=positions?positions[s]:pos_base+s;
             int st0=ks->kv_start[layer];
-            int ns=(dnsel && dnsel[s]>0)?dnsel[s]:0;      /* DSA: top-k, altrimenti range pieno */
+            int ns=(dnsel && dnsel[s]>0)?dnsel[s]:0;      /* DSA: top-k, otherwise full range */
             int64_t nt = ns ? (int64_t)ns : (int64_t)pos+1-st0;
             if(nt>sc_cap) sc_cap=nt;
         }
@@ -3075,7 +3077,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
             float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
             int st0=ks->kv_start[layer];
-            int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
+            int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: top-k list or full range */
             const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
             int nt = ns ? ns : pos+1-st0;
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
@@ -3099,14 +3101,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         m->t_attn += now_s()-ta0;
         return;
     }
-    /* 2) ricostruzione di k_nope+value per TUTTI i token 0..Tk-1 (un solo matmul su kv_b) */
+    /* 2) reconstruct k_nope+value for ALL tokens 0..Tk-1 (one matmul over kv_b) */
     m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
     float *kvb_all=falloc((int64_t)Tk*kvb_dim);
     matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
     m->t_kvb += now_s()-tk0;
-    /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
-     * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
+    /* 3) causal attention: score = q_pass·k_nope + q_rot·k_rot
+     * (scores live on the per-thread heap: see the comment in the absorb branch) */
     int64_t sc_cap = Tk - stL;
     float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
     double tac=now_s();
@@ -3117,7 +3119,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         const float *qr=qp+c->qk_nope;
         float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
         int st0=m->kv_start[layer];
-        int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
+        int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: top-k list or full range */
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
@@ -3143,11 +3145,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     attention_rows(m,l,layer,x,S,pos_base,NULL,NULL,out);
 }
 
-/* MoE GLM su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, + shared expert).
- * BATCH-UNION: per S>1 (prefill, verifica MTP) ogni expert UNICO del batch viene caricato
- * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
- * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
- * nell'ordine (routed nel loro ordine di union, poi shared). */
+/* GLM MoE on x[S,hidden] -> out (sigmoid/noaux_tc router, n_group=1, + shared expert).
+ * BATCH-UNION: for S>1 (prefill, MTP verify) each UNIQUE expert of the batch is loaded
+ * once and multiplied for every position that uses it (weights read once);
+ * the shared expert is a single matmul over S rows. Per-position accumulation stays
+ * in order (routed in their union order, then shared). */
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
     ESlot *P=m->pin[layer];
@@ -3158,10 +3160,10 @@ static int expert_is_resident(Model *m, int layer, int eid){
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
-    if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
-                         * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
-                         * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
-                         * per tutto il resolve/matmul/promozione qui sotto). */
+    if(g_pilot_real){   /* cross-layer barrier: take ownership of THIS layer and wait for
+                         * any in-flight pilot load on the same layer (after that the worker
+                         * drops every new load <= layer -> ecache[layer] stays stable
+                         * through the resolve/matmul/promotion sequence below). */
         pthread_mutex_lock(&g_pilot_mx);
         atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
         while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
@@ -3181,15 +3183,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         rank_w=malloc((size_t)rank_cap*sizeof(float));
         if(!rank_buf||!rank_w){ free(rank_buf); free(rank_w); rank_buf=NULL; rank_w=NULL; do_cache_route=0; }
     }
-    /* ---- FASE A: routing di tutte le S posizioni ---- */
+    /* ---- PHASE A: route all S positions ---- */
     double route_t0=g_prof?now_s():0;
     int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
     int *keff=malloc(S*sizeof(int));
-    /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
+    /* Router in ONE batched matmul: same math, without the S separate S=1 calls */
     float *logits_all=falloc((int64_t)S*E);
     int pre_routed=0; (void)pre_routed;
 #ifdef COLI_METAL
-    if(g_pre_idx){                               /* routing gia' calcolata dal layer CB (GPU) */
+    if(g_pre_idx){                               /* routing already computed by the layer CB (GPU) */
         memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
         memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
         memcpy(keff,g_pre_keff,(size_t)S*sizeof(int));
@@ -3206,7 +3208,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 #endif
     if(!pre_routed) matmul(logits_all, x, l->router, S, D, E);
-    if(!pre_routed)
+    if(!pre_routed){
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
@@ -3331,6 +3333,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
+    }
     free(rank_buf); free(rank_w);
     if(g_prof)m->t_route+=now_s()-route_t0;
     if(g_route_fp) g_route_call++;
@@ -3338,7 +3341,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
     if(g_looka && S==1 && layer<c->n_layers){
         int Ke=keff[0];
-        if(m->enr[layer]>0){                       /* [0] vs routing del token precedente */
+        if(m->enr[layer]>0){                       /* [0] vs previous token's routing */
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<m->enr[layer];z++)
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
@@ -3350,7 +3353,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
-    /* ---- FASE B: union degli expert del batch ---- */
+    /* ---- PHASE B: union of the batch's experts ---- */
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
     unsigned char seen[E]; memset(seen,0,(size_t)E);
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
@@ -3423,13 +3426,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         nu=nu2;
         free(wsum); free(is_hit); free(keep);
     }
-    /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
+    /* ---- PHASE C/D: resolve (pin/cache/disk) and compute, in blocks of 64 unique experts ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
 #ifdef COLI_CUDA
-    /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
-     * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
-     * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
+    /* PIPE Inc.1b: prefill batch-union goes through GPU groups — before this,
+     * 9343 experts in VRAM stayed UNUSED during prefill
+     * (measured: 81s of expert matmuls entirely on CPU, GPU groups 21ms total). */
     int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
@@ -3517,13 +3520,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 pipe_dispatch(m,layer,eids,nmiss);
                 m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
                                                      * are timed as service inside expert_load */
-            } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
+            } else { double t0=now_s();             /* ORIGINAL: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
                 for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1);
                 m->t_ewait += now_s()-t0; }         /* compute thread blocked for the whole load */
         }
-        /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
-         * questo — il kernel legge in background, le pread dopo trovano cache calda */
+        /* ASYNC I/O: readahead (WILLNEED) for the NEXT block while we compute this one
+         * — the kernel reads in the background, later preads find a warm cache */
         if(base+64<nu){
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
             for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
@@ -3578,7 +3581,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
 #endif
-            int nr=0;                                 /* righe (posizioni) che usano questo expert */
+            int nr=0;                                 /* rows (positions) that use this expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
@@ -3687,15 +3690,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
               else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
-        }
+        }                                            /* LRU promotion (swap buffer) */
     }
-    /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
+    /* ---- PHASE E: shared expert (PIPE2: already on device; Metal CB: already accumulated) ---- */
     if(!with_shared) goto shared_done;
     {
     float *sg=NULL,*su=NULL;int shared_cuda=0;
 #ifdef COLI_METAL
     if(g_pre_sh){ for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=g_pre_sh[z]; shared_on_gpu=1; }
-    if(shared_on_gpu) shared_cuda=2;             /* gia' sommato in out: salta calcolo e add */
+    if(shared_on_gpu) shared_cuda=2;             /* already accumulated into out: skip compute and add */
 #endif
 #ifdef COLI_CUDA
     int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
@@ -3738,10 +3741,10 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
-/* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
- * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
- * kind 0 = stesso layer saltando l'attention
- * kind 1 = layer successivo (PILOT: stale state, 75.8% recall)
+/* LOOKA: predict the target layer's router top-K from state h (residual stream),
+ * using the SAME pipeline as real routing (post_ln -> router -> sigmoid+bias, top-K).
+ * kind 0 = same layer while skipping attention
+ * kind 1 = next layer (PILOT: stale state, 75.8% recall)
  * kind 2 = two-step: approximate L's shared expert output, add to state, THEN predict L+1.
  *   The shared expert is resident (part of dense model), so this adds 3 small matmuls
  *   but no disk I/O. The corrected state includes the dominant part of MoE(L) that the
@@ -3799,57 +3802,57 @@ static void la_predict(Model *m, int target, const float *h, int kind){
     free(nrm); free(ch);
 }
 
-/* PILOTA: prefetch guidato dal router. Predice il top-K del layer L+1 dallo stato
- * post-attention di L (recall misurato 71.6% su GLM-5.2, vs 41.3% del token precedente)
- * e lancia il WILLNEED degli expert mancanti MENTRE il MoE di L legge i suoi: il disco
- * lavora nei tempi morti del calcolo invece di aspettare il routing vero. Con MTP attiva
- * predice per TUTTE le posizioni del draft: la speculazione pilota anche l'I/O.
- * PILOT_K limita alle prime k predizioni (la testa del ranking e' piu' affidabile
- * della coda: meno banda sprecata sulle predizioni sbagliate).
+/* PILOT: router-guided prefetch. Predict the top-K of layer L+1 from layer L's
+ * post-attention state (measured recall 71.6% on GLM-5.2, vs 41.3% from the previous token)
+ * and issue WILLNEED for the missing experts WHILE MoE(L) reads its own: the disk
+ * works in compute slack instead of waiting for the real routing. With MTP active
+ * it predicts for ALL positions of the draft: speculation pilots I/O too.
+ * PILOT_K limits this to the first k predictions (the head of the ranking is more reliable
+ * than the tail: less bandwidth wasted on wrong predictions).
  *
- * I WILLNEED partono da un THREAD I/O dedicato: con la coda disco satura la submit
- * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
- * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
- * (un hint perso non e' un errore). */
+ * The WILLNEEDs are issued from a dedicated I/O THREAD: with a saturated disk queue
+ * the fadvise submit BLOCKS (~0.5ms x 169k calls = +92s/48 tokens, measured) — inline
+ * the pilot cost more than it returned. Lock-free 1P/1C ring; full = drop
+ * (a lost hint is not an error). */
 static struct { int l,e; } pilot_q[4096];
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
-/* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
- * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
- * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
+/* PILOT_REAL: REAL load of the predicted expert into the FUTURE layer's LRU. See
+ * the safety invariant next to g_pilot_real. The slow pread runs OUTSIDE the lock;
+ * the lock protects only slot selection/publication and the handshake with MAIN. */
 static void pilot_realload(Model *m, int layer, int eid){
     pthread_mutex_lock(&g_pilot_mx);
     if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-        pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
+        pthread_mutex_unlock(&g_pilot_mx); return;      /* MAIN already owns this layer */
     }
-    ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
+    ESlot *P=m->pin[layer];                             /* already resident (pin or ecache)? skip */
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
     ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
     for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
+    int slot,isnew;                                     /* grow if there is room, otherwise LRU */
     if(nn<m->ecap){ slot=nn; isnew=1; }
     else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
     ESlot *dst=&Sl[slot];
-    dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
+    dst->eid=-1;                                        /* hide from scan hints while loading */
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0);              /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server */
+    int rc=expert_load(m,layer,eid,dst,0);              /* REAL pread — outside the lock, overlapped with compute; fatal=0: a speculative error must NOT kill the server */
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-        if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
+        if(isnew) m->ecn[layer]=slot+1;                 /* publish the slot ONLY now that eid is valid */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
+        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load failed: slot stays hidden (eid=-1), never published */
     }
     g_pilot_inflight[layer]--;
     pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
-    if(rc!=0)                                            /* mai swallow silenzioso: logga (una riga) e prosegui */
-        fprintf(stderr,"[PILOT] load speculativo abbandonato: layer %d expert %d (I/O error/short read) — nessun impatto sull'output\n",layer,eid);
+    if(rc!=0)                                            /* never swallow silently: log one line and continue */
+        fprintf(stderr,"[PILOT] speculative load abandoned: layer %d expert %d (I/O error/short read) — no impact on output\n",layer,eid);
 }
 #ifdef __linux__
 typedef struct { int layer,eid,li; ESlot *dst; } PilotUringDone;
@@ -4078,10 +4081,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
 #ifdef COLI_CUDA
-/* Inc.2a — intero layer SPARSO residente sul device del layer. x_dev entra e resta;
- * lasciano il device solo: nrm post-attention (router + expert CPU + gather dei
- * gruppi), i nuovi record KV, e la nrm pre-attention sui layer con indexer DSA.
- * Ritorna 0 su errore: il chiamante ripristina lo snapshot e rifa' il layer su CPU. */
+/* Inc.2a — entire SPARSE layer resident on the layer's device. x_dev enters and stays;
+ * only the post-attention norm leaves the device (router + CPU expert + group gather),
+ * along with the new KV records and the pre-attention norm on layers with a DSA indexer.
+ * Returns 0 on error: the caller restores the snapshot and reruns the layer on CPU. */
 static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, int pos_base,
                              float *nrm_host, float *out_host){
     Cfg *c=&m->c; int D=c->hidden, dev=l->kv_b.cuda_device;
@@ -4116,7 +4119,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
         }
     }
     if(!attn_pipe_prefill(m,l,li,nrm_d,1,S,pos_base,NULL,y_d)) return 0;
-    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;         /* prima mutazione */
+    if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;         /* first mutation */
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
@@ -4169,8 +4172,8 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
 #ifdef COLI_METAL
     /* FULL-LAYER CB: in_ln + attention + residuo + post_ln + shared expert + router/top-K
-     * in un solo submit GPU; la CPU legge il routing e fa solo resolve/disk/expert-CB.
-     * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
+     * in a single GPU submit; the CPU only reads routing and does resolve/disk/expert-CB.
+     * Fallback: any missing condition -> full CPU path below.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
@@ -4244,15 +4247,15 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
 static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                                 KVState *const *kvs, const int *positions){
     Cfg *c=&m->c; int D=c->hidden;
-    if(g_pilot_real){   /* nuovo forward: il possesso-layer riparte da -1 (i layer si rifanno da 0) */
+    if(g_pilot_real){   /* new forward: layer ownership resets to -1 (layers are redone from 0) */
         pthread_mutex_lock(&g_pilot_mx);
         atomic_store_explicit(&g_cur_moe_layer,-1,memory_order_release);
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
 #ifdef COLI_CUDA
-    /* PIPE2 (Inc.2a): il residuo resta sul device del layer, saltando tra le schede
-     * ai confini di layer. x host diventa STALE finche' la residenza e' attiva.
+    /* PIPE2 (Inc.2a): the residual stays on the layer's device, hopping between cards
+     * at layer boundaries. Host x becomes STALE while residency is active.
      *
      * S threshold is device-count-dependent (#273): on a single GPU the resident
      * stream wins at S=1 (evicts the CPU round-trips that dominate small-batch
@@ -4295,7 +4298,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                 if(ok){
                     x_dev=dst; x_dev_on=dev;
                     if(pipe_layer_sparse(m,l,i,x_dev,S,pos_base,nrm,tmp)) continue;
-                    /* fallback: snapshot -> host, layer rifatto sul percorso CPU */
+                    /* fallback: snapshot -> host, layer rerun on the CPU path */
                     coli_cuda_pipe_peer_copy(dev,x_dev,dev,coli_cuda_pipe_scratch(dev,14,xb),xb);
                     coli_cuda_pipe_download(dev,x_dev,x,xb);
                     x_dev_on=-1;
@@ -4380,13 +4383,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     free(x); free(last); return logit;
 }
 
-/* come step(), ma ritorna i logits di TUTTE le S posizioni [S,vocab] (per la verifica spec) */
+/* like step(), but returns the logits of ALL S positions [S,vocab] (for speculative verification) */
 static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
-    if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
+    if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden of ALL positions (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
@@ -4430,9 +4433,9 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
     return logit;
 }
 
-/* METODO E — prompt-lookup: cerca l'occorrenza piu' recente dell'ultimo bigramma nel
- * contesto e propone i token che la seguirono. Zero pesi extra, zero costo: e' solo
- * un'ipotesi che il modello verifichera'. */
+/* METHOD E — prompt lookup: find the most recent occurrence of the last bigram in
+ * the context and propose the tokens that followed it. Zero extra weights, zero cost:
+ * it is only a hypothesis the model will verify. */
 static int ngram_draft(const int *ids, int len, int G, int *draft){
     if(len<4 || G<1) return 0;
     int a=ids[len-2], b=ids[len-1];
@@ -4444,11 +4447,11 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
     return 0;
 }
 
-/* METODO MTP: propone fino a G draft con la testa multi-token nativa di GLM-5.2.
+/* MTP METHOD: propose up to G drafts with GLM-5.2's native multi-token head.
  * Input: next_tok (appena emesso, posizione kv) e hlast (hidden pre-norm della pos kv-1).
  * Catena DeepSeek-V3: h' = Layer78( eh_proj[ enorm(emb(tok)) ; hnorm(h) ] ),
- * draft = argmax(lm_head(shared_head.norm(h'))). La KV del layer MTP vive alla riga n_layers
- * ed e' valida da kv_start (niente prefill: finestra di solo-decode, basta per il draft). */
+ * draft = argmax(lm_head(shared_head.norm(h'))). The MTP layer's KV lives in row n_layers
+ * and is valid from kv_start onward (no prefill: a decode-only window is enough for drafting). */
 static int mtp_argmax(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
@@ -4460,13 +4463,13 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h, m->hlast, D*sizeof(float));
     int tok=next_tok, n=0;
-    m->ld_ctx=1;                                 /* DISK_SPLIT: i load da qui sono draft-path */
+    m->ld_ctx=1;                                 /* DISK_SPLIT: loads from here are draft-path */
     int prenorm = getenv("MTP_PRENORM")!=NULL;
     for(int g=0; g<G; g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
         embed_row(m, tok, x);
         rmsnorm(x, x, m->enorm, D, c->eps);
-        if(g==0 && !prenorm) rmsnorm(h, h, m->final_norm, D, c->eps);  /* h vero: post model.norm */
+        if(g==0 && !prenorm) rmsnorm(h, h, m->final_norm, D, c->eps);  /* real h: post model.norm */
         rmsnorm(h, h, m->hnorm, D, c->eps);
         if(getenv("MTP_SWAP")){ memcpy(cat, h, D*sizeof(float)); memcpy(cat+D, x, D*sizeof(float)); }
         else { memcpy(cat, x, D*sizeof(float)); memcpy(cat+D, h, D*sizeof(float)); }
@@ -4489,9 +4492,9 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
     return n;
 }
-/* assorbe nella KV della testa MTP le coppie VERIFICATE (emb(token@pos+1), h_vero@pos):
- * next_ids[i] = token alla posizione pos_base+i+1; x[i] = hidden VERO a pos_base+i.
- * Un solo passaggio batch del layer MTP (il batch-union rende economici gli expert). */
+/* Absorb VERIFIED pairs into the MTP head's KV (emb(token@pos+1), real_h@pos):
+ * next_ids[i] = token at position pos_base+i+1; x[i] = REAL hidden at pos_base+i.
+ * One batched pass through the MTP layer (batch-union keeps the experts cheap). */
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base){
     if(!m->has_mtp || S<1) return;
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
@@ -4509,7 +4512,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
         matmul_qt(hx+(int64_t)i*D, cat, &m->eh_proj, 1);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
-    m->ld_ctx=2;                                 /* DISK_SPLIT: load del layer MTP in absorb */
+    m->ld_ctx=2;                                 /* DISK_SPLIT: MTP-layer loads in absorb */
     layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
     m->ld_ctx=0;
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
@@ -4523,11 +4526,11 @@ static inline int argmax_v(const float *lo, int V){
     return b<0?0:b;
 }
 
-/* ---- METODO F: draft grammaticale (#48) ----
- * gr_feed consuma i byte di ogni token EMESSO e tiene il walker in sync con l'output;
- * grammar_draft propone lo span FORZATO successivo (un solo byte legale per posizione)
- * gia' tokenizzato. Il confine di tokenizzazione non e' garantito coincidere con quello
- * del modello: la verifica assorbe la differenza (al peggio l'ultimo draft e' rifiutato). */
+/* ---- METHOD F: grammar drafting (#48) ----
+ * gr_feed consumes the bytes of each EMITTED token and keeps the walker in sync with output;
+ * grammar_draft proposes the next FORCED span (one legal byte per position),
+ * already tokenized. Tokenization boundaries are not guaranteed to match the model's:
+ * verification absorbs the difference (at worst the last draft token is rejected). */
 static void grammar_setup(Tok *T){
     /* GRAMMAR=<file.gbnf> takes precedence; SCHEMA=<file.json> compiles a JSON-Schema
      * to GBNF (schema_gbnf.h) for the same draft source. Both fail soft: the engine
@@ -4560,33 +4563,33 @@ static void grammar_setup(Tok *T){
     g_gr_T=T; g_gr_on=1;
     fprintf(stderr,"[GRAMMAR] %s: %d rules, forced span capped at %d tokens/forward\n",path,g_gram.n,g_gr_max);
 }
-/* stato pulito all'inizio di ogni RISPOSTA (non tra i \x02MORE, che continuano) */
+/* clean state at the start of each REPLY (not between \x02MORE frames, which continue it) */
 static void grammar_reset(void){
     if(!g_gr_on) return;
     gr_state_init(&g_gst,&g_gram); g_gr_armed=0;
     if(!g_gst.alive) g_gr_on=0;
 }
-/* consuma i byte di un token emesso. Preambolo (prima dell'arming): ignorato.
- * Desync dopo l'arming: si riarma in attesa del prossimo inizio valido — al peggio
- * i draft vengono rifiutati dalla verifica, l'output non cambia MAI. */
+/* consume the bytes of an emitted token. Preamble (before arming): ignored.
+ * Desync after arming: re-arm and wait for the next valid start — at worst
+ * drafts are rejected by verification, the output NEVER changes. */
 static void gr_feed(int t){
     if(!g_gr_on||!g_gr_T) return;
     char b[64]; int n=tok_decode(g_gr_T,&t,1,b,63);
     for(int i=0;i<n;i++){
         int r=gr_accept(&g_gst,(unsigned char)b[i]);
         if(r==1){ g_gr_armed=1; continue; }
-        if(r<0){ g_gr_on=0; return; }                 /* walker spento: fine dei draft */
-        if(!g_gr_armed) continue;                     /* preambolo: aspetta l'inizio */
-        gr_state_init(&g_gst,&g_gram); g_gr_armed=0;  /* desync: riparti dalla radice */
+        if(r<0){ g_gr_on=0; return; }                 /* walker off: end of grammar drafts */
+        if(!g_gr_armed) continue;                     /* preamble: wait for the start */
+        gr_state_init(&g_gst,&g_gram); g_gr_armed=0;  /* desync: restart from the root */
         if(!g_gst.alive){ g_gr_on=0; return; }
         if(gr_accept(&g_gst,(unsigned char)b[i])==1) g_gr_armed=1;
     }
 }
-/* propone lo span forzato come token (max cap); 0 se la grammatica dirama qui */
+/* propose the forced span as tokens (max cap); 0 if the grammar branches here */
 static int grammar_draft(int *draft, int cap){
     if(!g_gr_on||!g_gr_armed||!g_gr_T||cap<1) return 0;
-    if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* guardia adattiva, come per MTP:
-        acceptance sotto il 50% = tokenizzazione fuori asse, meglio spegnersi */
+    if(g_gr_prop>=32 && g_gr_acc*2<g_gr_prop){        /* adaptive guard, as for MTP:
+        acceptance below 50% = tokenization out of phase, better to turn it off */
         g_gr_on=0;
         fprintf(stderr,"[GRAMMAR] %.0f%% acceptance after %llu proposals: grammar drafts disabled\n",
             100.0*g_gr_acc/g_gr_prop,(unsigned long long)g_gr_prop);
@@ -4598,51 +4601,51 @@ static int grammar_draft(int *draft, int cap){
     return g>0?g:0;
 }
 
-/* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
- * Il draft (MTP/n-gram) e' DETERMINISTICO (argmax della testa): q = massa puntuale.
- * Rejection sampling di Leviathan: accetta il draft x_d con prob p(x_d); al rifiuto
- * ricampiona da p con x_d azzerato e rinormalizzato. La distribuzione risultante e'
- * ESATTAMENTE p: la speculazione resta invisibile all'output anche col sampling. */
+/* ---- SAMPLING (temperature + nucleus) with LOSSLESS speculative verification ----
+ * The draft (MTP/n-gram) is DETERMINISTIC (head argmax): q = point mass.
+ * Leviathan rejection sampling: accept draft x_d with probability p(x_d); on rejection
+ * resample from p with x_d zeroed and renormalized. The resulting distribution is
+ * EXACTLY p: speculation stays invisible in the output even with sampling. */
 static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
 static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
     return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
-static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
-/* sift-down su max-heap in h[0..n), chiave = g_pbuf[h[i]] (#335: partial top-p select).
- * Versione "a buco": porta il valore di radice e lo deposita solo alla fine, cosi'
- * heapify e' O(V) e ogni pop e' O(log n) senza qsort sull'intero vocabolario. */
+static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* reused buffers (single-thread decode) */
+/* sift-down on the max-heap in h[0..n), key = g_pbuf[h[i]] (#335: partial top-p select).
+ * "Hole" version: carry the root value down and deposit it only at the end, so
+ * heapify is O(V) and each pop is O(log n) without qsort over the whole vocabulary. */
 static void topp_siftdown(int *h, int n, int i){
     int iv=h[i]; float kv=g_pbuf[iv];
     for(;;){ int l=2*i+1;
-        if(l>=n) break;                      /* foglia */
-        int b=l; if(l+1<n && g_pbuf[h[l+1]]>g_pbuf[h[l]]) b=l+1;  /* figlio maggiore */
-        if(g_pbuf[h[b]]<=kv) break;          /* nessun figlio supera la radice -> ferma */
+        if(l>=n) break;                      /* leaf */
+        int b=l; if(l+1<n && g_pbuf[h[l+1]]>g_pbuf[h[l]]) b=l+1;  /* larger child */
+        if(g_pbuf[h[b]]<=kv) break;          /* no child exceeds the root -> stop */
         h[i]=h[b]; i=b; }
     h[i]=iv;
 }
-/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc.
- * Invariante per dist_sample: g_pbuf resta INDICIZZATO per token-id (mai riordinato);
- * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
+/* Build the target distribution in g_pbuf: softmax(lo/temp) truncated to top-p g_nuc.
+ * Invariant for dist_sample: g_pbuf remains INDEXED by token id (never reordered);
+ * the truncated tail must be ZEROED in g_pbuf (dist_sample reads it directly by id). */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
-    /* Un solo logit NaN/+Inf avvelenava tutto (#369): +Inf diventava mx, NaN/Inf-mx
-     * -> expf NaN -> s NaN -> ogni prob NaN -> dist_sample cade sul fallback
-     * `g_pbuf[i]>0` (NaN>0 e' falso ovunque) e ritorna 0 PER SEMPRE, in silenzio.
-     * Difesa: mx solo sui finiti; un logit non finito contribuisce prob 0;
-     * se la distribuzione degenera (tutti non finiti / somma non valida) si
-     * ripiega sull'argmax dei finiti e si avvisa UNA volta, mai in silenzio. */
+    /* A single NaN/+Inf logit used to poison everything (#369): +Inf became mx, NaN/Inf-mx
+     * -> expf NaN -> s NaN -> every prob NaN -> dist_sample fell to the fallback
+     * `g_pbuf[i]>0` (NaN>0 is false everywhere) and returned 0 FOREVER, silently.
+     * Defense: compute mx only over finite values; a non-finite logit contributes prob 0;
+     * if the distribution degenerates (all non-finite / invalid sum), fall back to
+     * argmax over finite logits and warn ONCE, never silently. */
     int mxi=-1; float mx=0;
     for(int i=0;i<V;i++) if(isfinite(lo[i]) && (mxi<0 || lo[i]>mx)){ mx=lo[i]; mxi=i; }
     double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
     if(mxi>=0){
         for(int i=0;i<V;i++){ g_pbuf[i]=isfinite(lo[i])?expf((lo[i]-mx)*invt):0.f; s+=g_pbuf[i]; }
     }
-    if(mxi<0 || !isfinite(s) || s<=0.0){          /* distribuzione inutilizzabile */
+    if(mxi<0 || !isfinite(s) || s<=0.0){          /* unusable distribution */
         static int warned=0;
         if(!warned){ warned=1; fprintf(stderr,
             "[SAMPLE] warning: non-finite logits (NaN/Inf) — falling back to argmax; "
             "output may be degraded. This usually means a numerical blow-up upstream.\n"); }
-        int a=(mxi>=0)?mxi:0;                       /* mxi = argmax dei logit FINITI (robusto
-                                                     * anche se lo[0] e' NaN, dove argmax_v fallirebbe) */
+        int a=(mxi>=0)?mxi:0;                       /* mxi = argmax of FINITE logits (robust
+                                                     * even if lo[0] is NaN, where argmax_v would fail) */
         for(int i=0;i<V;i++) g_pbuf[i]=0.f; g_pbuf[a]=1.f;
         return;                                    /* delta su un token valido, niente top-p su NaN */
     }
@@ -4650,21 +4653,21 @@ static void dist_build(const float *lo, int V){
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
         for(int i=V/2-1;i>=0;i--) topp_siftdown(g_pidx,V,i);   /* heapify O(V) */
-        /* pop verso la coda: i vincitori (testa top-p) cadono in g_pidx[out..V-1] in ordine
-         * DECRESCENTE, come il vecchio qsort, quindi s2 accumula nello stesso ordine ->
-         * head bit-identical sui casi senza pareggi (i pareggi erano gia' non specificati
-         * sotto il qsort instabile e restano tali). Il prefisso g_pidx[0..out-1) e' la coda. */
+        /* pop toward the tail: the winners (the top-p head) fall into g_pidx[out..V-1] in
+         * DESCENDING order, like the old qsort, so s2 accumulates in the same order ->
+         * the head stays bit-identical in tie-free cases (ties were already unspecified
+         * under unstable qsort and remain so). The prefix g_pidx[0..out-1) is the tail. */
         double s2=0, cum=0; int out=V;
-        do{ int root=g_pidx[0];                  /* massimo corrente */
-            g_pidx[0]=g_pidx[--out]; g_pidx[out]=root;          /* sposta il max in coda */
+        do{ int root=g_pidx[0];                  /* current maximum */
+            g_pidx[0]=g_pidx[--out]; g_pidx[out]=root;          /* move the max to the tail */
             s2+=g_pbuf[root]; cum+=g_pbuf[root];
             if(out>0) topp_siftdown(g_pidx,out,0);
         } while(cum<g_nuc && out>0);
-        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;            /* azzera la coda (invariante) */
-        float s2f=(float)s2; for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=s2f;  /* rinormalizza */
+        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;            /* zero the tail (invariant) */
+        float s2f=(float)s2; for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=s2f;  /* renormalize */
     }
 }
-/* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
+/* sample from g_pbuf; ban>=0 -> that token is excluded (renormalizing on the fly) */
 static int dist_sample(int V, int ban){
     double z = 1.0 - (ban>=0 ? g_pbuf[ban] : 0.0); if(z<=1e-12) z=1e-12;
     double u = rndu()*z, cum=0;
@@ -4672,36 +4675,36 @@ static int dist_sample(int V, int ban){
     for(int i=V-1;i>=0;i--) if(i!=ban && g_pbuf[i]>0) return i;
     return 0;
 }
-/* prossimo token dai logits: greedy se g_temp<=0, altrimenti sampling.
- * ban = token escluso perche' rifiutato dalla verifica speculativa precedente. */
+/* next token from the logits: greedy if g_temp<=0, otherwise sampling.
+ * ban = token excluded because it was rejected by previous speculative verification. */
 static int pick_tok(const float *lo, int V, int ban){
     if(g_temp<=0) return argmax_v(lo,V);
     dist_build(lo,V);
     return dist_sample(V,ban);
 }
 
-/* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
- * dove si genera un numero fisso di token da confrontare con l'oracolo) */
-static int g_stop[64], g_nstop=0;   /* config eos + ogni added-token "special" del tokenizer */
+/* active stop set (filled by run_text/run_serve from config; empty in validation,
+ * where a fixed number of tokens is generated and compared with the oracle) */
+static int g_stop[64], g_nstop=0;   /* config eos + every tokenizer added-token marked "special" */
 static void repin_pass_limit(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
-/* T=NULL -> solo gli stop del config (validazione/oracolo, dove il tokenizer non serve). */
+/* T=NULL -> only config stops (validation/oracle, where the tokenizer is not needed). */
 static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     g_nstop=0;
     for(int i=0;i<c->n_stop && g_nstop<64;i++) g_stop[g_nstop++]=c->stop_ids[i];
     if(tok_eos>=0 && !is_stop(tok_eos) && g_nstop<64) g_stop[g_nstop++]=tok_eos;
     int nsp=0;
-    /* DIFESA IN PROFONDITA' (woolcoxm, #298): il tokenizer marca "special":true i token di
-     * CONTROLLO -- <|user|>, <|assistant|>, <|observation|>, <sop>, [gMASK], i marker
-     * image/video/audio. Nessuno di questi e' contenuto legittimo di una risposta: se il
-     * modello ne emette uno, il turno e' finito (infatti GLM ne elenca tre fra gli eos
-     * ufficiali). Senza questo, uno di quei token non elencato nel config veniva
-     * DETOKENIZZATO E STAMPATO IN CHAT come testo, e la generazione proseguiva oltre la
-     * fine reale -- l'"added stuff on the end" riportato su un checkpoint convertito.
-     * Fidarsi del config di pesi convertiti da terzi e' precisamente cio' che non
-     * possiamo controllare; il flag del tokenizer lo possiamo leggere.
-     * NB: <think>/<tool_call>/<arg_key> hanno "special":false e restano contenuto vero. */
+    /* DEFENSE IN DEPTH (woolcoxm, #298): the tokenizer marks CONTROL tokens
+     * "special":true -- <|user|>, <|assistant|>, <|observation|>, <sop>, [gMASK], and
+     * image/video/audio markers. None of these is legitimate answer content: if the
+     * model emits one, the turn is over (GLM in fact lists three of them among official EOSs).
+     * Without this, one such token omitted from config got DETOKENIZED AND PRINTED IN CHAT
+     * as text, and generation continued past the real end -- the "added stuff on the end"
+     * reported on a converted checkpoint.
+     * Trusting the config of weights converted by third parties is exactly what we cannot
+     * control; the tokenizer flag we can read.
+     * NB: <think>/<tool_call>/<arg_key> have "special":false and remain real content. */
     if(T) for(int id=0; id<T->n_ids && g_nstop<64; id++)
         if(T->id_special[id] && !is_stop(id)){ g_stop[g_nstop++]=id; nsp++; }
     fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
@@ -4711,22 +4714,18 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
 }
 static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c,tok_eos,NULL); }
 
-/* decode greedy con SELF-SPECULATION n-gram: LOSSLESS (output identico al greedy puro).
- * Ogni forward verifica fino a g_draft token proposti dal contesto: i token accettati
- * costano UNA sola passata sui pesi -> disco e banda RAM ammortizzati su piu' token.
- * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
- * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
- * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
-/* STOP MORBIDO (serve/chat): SIGINT chiude il turno CORRENTE per la stessa via
- * del tetto NGEN (stats, usage_save, KV append, sentinella END tutti normali)
- * invece di uccidere il motore; :more puo' continuare la risposta interrotta.
- * Il flag e' armato solo nei serve-loop (intr_install): nei run one-shot e in
- * validazione SIGINT resta il default (morte immediata). Solo POSIX: su
- * Windows il comportamento di Ctrl-C non cambia.
- * EN: soft stop (serve/chat): SIGINT ends the CURRENT turn through the same
- * path as the NGEN cap — stats/usage/KV/END sentinel all normal — instead of
- * killing the engine; :more can continue the interrupted answer. Armed only
- * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
+/* Greedy decode with n-gram SELF-SPECULATION: LOSSLESS (output identical to pure greedy).
+ * Each forward verifies up to g_draft tokens proposed from context: accepted tokens
+ * cost only ONE pass over the weights -> disk and RAM bandwidth amortized across more tokens.
+ * all: token history (capacity >= kv+n_new+g_draft+2), kv = tokens already in KV.
+ * logit = logits at position kv-1 (from prefill); freed here.
+ * emit(tok,ud) for each emitted token. Returns the emitted token count; *kv_out = new kv. */
+/* SOFT STOP (serve/chat): SIGINT ends the CURRENT turn through the same path as
+ * the NGEN cap (stats, usage_save, KV append, END sentinel all normal) instead of
+ * killing the engine; :more can continue the interrupted reply.
+ * The flag is armed only in the serve loops (intr_install): in one-shot runs and in
+ * validation, SIGINT keeps its default behavior (immediate death). POSIX only: on
+ * Windows Ctrl-C behavior does not change. */
 static volatile sig_atomic_t g_intr=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
@@ -4743,34 +4742,34 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                        void (*emit)(int,void*), void *ud, int *kv_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
-    int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
-    /* #163: draft del modello attivi -> pin della famiglia di kernel per draft+verifica.
+    int carry_ban=-1;                    /* token rejected by verification: excluded from resampling */
+    /* #163: model drafts active -> pin the kernel family for draft+verify forwards.
      * EN: model drafts live -> pin the kernel family for draft+verify forwards. */
     g_spec_live = (g_draft>0);
     if(spec_pinned() && m->has_mtp){ static int once=0; if(!once){ once=1;
         fprintf(stderr,"[SPEC_PIN] draft+verify pinned to the S=1 kernel family: int4=%s int8=%s (#163; SPEC_PIN=0 for A/B)\n",
             (g_idot&&g_i4s<=1)?"idot":"exact", g_idot?"idot":"exact"); } }
-    /* guardia MTP morbida (#163): finestra di 24 proposte, pausa e ri-arma invece del
-     * latch permanente — una regressione transitoria non spegne MTP per tutta la sessione.
+    /* soft MTP guard (#163): 24-proposal window, pause and re-arm instead of a
+     * permanent latch — a transient regression does not disable MTP for the whole session.
      * EN: soft MTP guard (#163): 24-proposal window, pause and re-arm instead of the
      * permanent latch — a transient collapse no longer kills MTP for the whole session. */
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
-    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
+    while(emitted<n_new && !done && !g_intr){   /* g_intr: same exit path as the n_new cap */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
-        gr_feed(next);                                  /* il walker segue l'output emesso */
-        if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
-        int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
-        if(g_gr_on){                                    /* metodo F: prima la grammatica — dove
-                                                         * forza, l'acceptance e' ~1 (#48) */
+        gr_feed(next);                                  /* the walker follows emitted output */
+        if(emitted>=n_new) break;                       /* the last token does not need a forward */
+        int g = 0, gsrc = 0;                            /* source: 1=grammar 2=MTP/n-gram */
+        if(g_gr_on){                                    /* method F: grammar first — where it
+                                                         * forces, acceptance is ~1 (#48) */
             g=grammar_draft(draft,g_gr_max);
             if(g>0) gsrc=1;
         }
         if(!g && g_draft>0 && m->has_mtp){
-            /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
-             * ma il vecchio g_draft=0 era permanente. EN: adaptive pause; the old
+            /* adaptive pause: drafts that are never accepted are pure disk tax,
+             * but the old g_draft=0 latch was permanent. EN: adaptive pause; the old
              * g_draft=0 latch was permanent. */
             if(gd_pause>0){ gd_pause--; if(!gd_pause){ gd_prop0=m->mtp_prop; gd_acc0=m->mtp_acc; } }
             else if(m->mtp_prop-gd_prop0>=24 && (m->mtp_acc-gd_acc0)*10 < m->mtp_prop-gd_prop0){
@@ -4792,7 +4791,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
         if(g_prof) prof_lat(now_s()-tf0);
-        int k=0;                                        /* verifica: accetta finche' coincide */
+        int k=0;                                        /* verification: accept while it matches */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
             fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
         while(k<g && emitted<n_new){
@@ -4807,8 +4806,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_gr_acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
-        if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
-        /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
+        if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* keep MTP KV in sync with accepted tokens */
+        /* hlast must correspond to the last ACCEPTED position (kv+k), not end-of-batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
         logit=falloc(V); memcpy(logit, lo+(int64_t)k*V, V*sizeof(float)); free(lo);
@@ -4823,7 +4822,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 /* emit callback: accumula in un array (validazione) */
 typedef struct { int *dst; int n; } EmitStore;
 static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
-/* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
+/* emit callback: detokenize and stream-print (chat/run), with heartbeat */
 typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
 static void emit_stream(int t, void *ud){
     EmitStream *e=(EmitStream*)ud; char dec[64];
@@ -4842,7 +4841,7 @@ static void emit_stream(int t, void *ud){
     }
 }
 
-/* teacher-forcing: un solo forward su ids[S], argmax per posizione in pred[S] */
+/* teacher forcing: one forward over ids[S], argmax per position into pred[S] */
 static void forward_all(Model *m, const int *ids, int S, int *pred){
     Cfg *c=&m->c; int D=c->hidden;
     kv_alloc(m,S);
@@ -4861,31 +4860,32 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     free(x); free(lo); free(row);
 }
 
-/* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
+/* log-prob (log-softmax) of the target token given the logits; *am=1 if it is the argmax */
 static double logprob_target(const float *lo, int V, int target, int *am){
     float mx=lo[0]; int best=0; for(int i=1;i<V;i++){ if(lo[i]>mx){mx=lo[i];best=i;} }
     double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
     if(am)*am=(best==target);
     return (double)(lo[target]-mx) - log(se);
 }
-/* "glm" contenuto in model_type, case-insensitive — stessa regola di detect_prefix
+/* "glm" contained in model_type, case-insensitive — same rule as detect_prefix
  * in tools/eval_glm.py (#194). Niente strcasestr: non esiste su MinGW/MSVC. */
 static int mt_is_glm(const char *s){
     if(s) for(;*s;s++) if((s[0]|32)=='g'&&(s[1]|32)=='l'&&(s[2]|32)=='m') return 1;
     return 0;
 }
-/* modalita' SCORING per i benchmark (stile lm-eval, log-likelihood):
- * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
- * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
- * Un solo forward per richiesta (teacher-forcing): niente generazione -> fattibile a bassa velocita'. */
+/* SCORING mode for benchmarks (lm-eval style, log-likelihood):
+ * input: file with lines "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
+ * output: line "<continuation_logprob> <contlen> <greedy 0/1>" per request.
+ * One forward per request (teacher forcing): no generation -> feasible even at low speed. */
 static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
-    /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
-     * scorare stream nudi e' out-of-distribution e deprime/distorce i punteggi. Se il config
-     * dice glm* gli id dei due token vengono chiesti al tokenizer.json dello snapshot (per
-     * GLM-5.2: 154822,154824 — mai fidarsi di costanti cablate, il vocabolario cambia tra
-     * release) e anteposti al CONTESTO delle richieste che non li hanno gia'; chi arriva GIA'
-     * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
+    /* GLM prefix (#108): the model sees [gMASK]<sop> at the front of EVERY training sequence —
+     * scoring bare streams is out-of-distribution and depresses/distorts the scores. If config
+     * says glm*, the ids of those two tokens are looked up in the snapshot's tokenizer.json (for
+     * GLM-5.2: 154822,154824 — never trust hard-coded constants, the vocabulary changes between
+     * releases) and prepended to the CONTEXT of requests that do not already have them; requests
+     * that arrive ALREADY prefixed (eval_glm.py post-#194) pass through UNCHANGED. SCORE_PREFIX=0
+     * restores bare behavior. */
     int pfx[2]={-1,-1}, pfx_on=0;
     if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
         char *ar=NULL; jval *r=cfg_root(snap,&ar);
@@ -4904,7 +4904,7 @@ static void run_score(Model *m, const char *snap, const char *path){
     int maxT=1; { char *ln=NULL; size_t cp=0;
         while(getline(&ln,&cp,f)>0){ int a,b; if(sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
         free(ln); }
-    if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
+    if(pfx_on) maxT+=2;   /* unprefixed requests grow by 2 tokens */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
     int *ids=malloc(maxT*sizeof(int));
@@ -4913,7 +4913,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
         if(T<=0||ctxlen<1){ printf("0 0 0\n"); fflush(stdout); continue; }
         for(int i=0;i<T;i++) ids[i]=strtol(p,&p,10);
-        if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* gia' prefissato -> intatto */
+        if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* already prefixed -> leave unchanged */
             memmove(ids+2,ids,(size_t)T*sizeof(int));
             ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
         }
@@ -5075,16 +5075,16 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
-/* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
- * detokenizza e stampa il testo in streaming. */
+/* real generation: tokenize PROMPT, prefill + greedy decode with EOS stop,
+ * detokenize and stream-print the text. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NOT the official 1.0 — the tail of the
+                                          * int4 distribution is quantization noise */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
@@ -5119,7 +5119,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\nprefill %d tokens in %.2fs | decode %d tokens in %.2fs (%.2f tok/s) | "
-           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%) | RSS %.2f GB",       /* split #336: quale tier serve gli hit */
+           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%) | RSS %.2f GB",       /* split #336: which tier serves the hits */
         np,prefill_t,produced,dt,produced/dt,tot?100.0*m->hits/tot:0.0,
         tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0, rss_gb());
     if(g_cache_route && m->route_slots)
@@ -5156,7 +5156,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
 #endif
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,produced,stdout);
-    if(g_pilot_real) printf("PILOT_REAL: %ld load cross-layer completati, %ld scartati (main gia' sul layer) | PILOT_K=%d\n",
+    if(g_pilot_real) printf("PILOT_REAL: %ld completed cross-layer loads, %ld dropped (main already on layer) | PILOT_K=%d\n",
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_pilot_two) printf("PILOT_TWO: two-step shared-expert-corrected prefetch active (3 extra matmuls/prediction)\n");
@@ -5178,18 +5178,52 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     usage_save(m);
 }
 
-/* modalita' SERVE (per la CLI 'coli'): carica il modello UNA volta, poi CHAT conversazionale.
- * KV-cache PERSISTENTE tra i turni: la storia resta in cache, si fa il prefill solo dei
- * token NUOVI -> il modello RICORDA la conversazione e non ri-processa il passato (lossless,
- * piu' umano, piu' veloce). Template chat GLM con token speciali (CHAT_TEMPLATE=0 -> grezzo).
- * Protocollo: "\x01\x01" "READY" "\x01\x01\n" dopo il load; risposta in streaming; "\x01\x01" "END" "\x01\x01\n" a fine turno.
- * ":reset" (riga "\x02RESET") azzera la memoria. EOF -> esce. */
-/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
- * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
- * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
- * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
- * 25% (+4) contro il ping-pong; max 4 scambi/passata (~20 MB di disco l'uno). Una heat
- * map separata decade a ogni passata: la storia persistente .coli_usage resta intatta.
+static void run_albate_ids(Model *m, const char *ids_spec){
+    Cfg *c=&m->c;
+    if(!ids_spec || !*ids_spec){ fprintf(stderr,"COLI_ALBATE_IDS is empty\n"); exit(2); }
+    int cap=64, n=0;
+    int *ids=malloc((size_t)cap*sizeof(int));
+    if(!ids){ fprintf(stderr,"OOM albate ids\n"); exit(1); }
+    const char *p=ids_spec;
+    while(*p){
+        while(*p && (isspace((unsigned char)*p) || *p==',' || *p==';')) p++;
+        if(!*p) break;
+        char *end=NULL;
+        long v=strtol(p,&end,10);
+        if(end==p){
+            fprintf(stderr,"invalid COLI_ALBATE_IDS near: %.32s\n", p);
+            free(ids);
+            exit(2);
+        }
+        if(n>=cap){
+            cap*=2;
+            ids=realloc(ids,(size_t)cap*sizeof(int));
+            if(!ids){ fprintf(stderr,"OOM albate ids grow\n"); exit(1); }
+        }
+        ids[n++]=(int)v;
+        p=end;
+    }
+    if(n<1){ fprintf(stderr,"COLI_ALBATE_IDS produced zero tokens\n"); free(ids); exit(2); }
+    kv_alloc(m,n+g_draft+2);
+    if(m->has_mtp) m->kv_start[c->n_layers]=-1;
+    albate_collect_arm();
+    float *logit=step(m, ids, n, 0);
+    free(logit);
+    free(ids);
+}
+
+/* SERVE mode (for the `coli` CLI): load the model ONCE, then run conversational CHAT.
+ * PERSISTENT KV-cache across turns: history stays in cache, prefill runs only on NEW
+ * tokens -> the model REMEMBERS the conversation and does not reprocess the past (lossless,
+ * more natural, faster). GLM chat template with special tokens (CHAT_TEMPLATE=0 -> raw).
+ * Protocol: "\x01\x01" "READY" "\x01\x01\n" after load; streaming reply; "\x01\x01" "END" "\x01\x01\n" at end of turn.
+ * ":reset" (line "\x02RESET") clears memory. EOF exits. */
+/* ---- RFC: LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
+ * Upstream AUTOPINs at START (from the .coli_usage history). This adds a between-turns
+ * re-pin: at the safe point after the reply, swap the worst pins for the hottest
+ * unpinned experts so the hot-store follows the LIVE workload without a separate profile.
+ * 25% (+4) hysteresis fights ping-pong; max 4 swaps/pass (~20 MB of disk each). A
+ * separate heat map decays every pass: persistent .coli_usage history stays intact.
  * EN: upstream AUTOPINs at START (from .coli_usage). This adds a between-turns re-pin: at
  * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
  * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
@@ -5231,24 +5265,24 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     return nb;
 }
 /* ---- RSS GUARD (#403) -----------------------------------------------------
- * La proiezione di cap_for_ram e' una STIMA: sul GB10 (#403) le generazioni
- * lunghe l'hanno sforata di ~40 GB (proiettato 74.4, reale 115.6 -> 3 kill del
- * kernel). La run D dell'issue prova che un cap piu' basso CONTIENE la crescita:
- * questa guardia lo fa da sola, sull'RSS MISURATO invece che sul proiettato.
- * Al safe point (stessa sede di repin: nessun moe in volo), ogni ~16 token
- * emessi: se l'RSS supera il budget, svuota gli slot LRU meno usati e abbassa
- * ecap perche' non ricrescano. Gli slab sono >128KB (mmap'd da glibc): la free
- * restituisce le pagine al kernel subito, quindi l'RSS scende davvero.
- * Lo slot NON viene compattato via: resta al suo posto con eid=-1/used=0 (primo
- * candidato al riuso), perche' con PILOT_REAL il worker tiene puntatori dentro
- * ecache[] durante i suoi pread e uno spostamento li invaliderebbe; per lo
- * stesso motivo gli slot eid<0 (riservati/in caricamento) non si toccano e la
- * selezione avviene sotto g_pilot_mx. resident_bytes resta invariato: gli slot
- * LRU non sono mai contati li' (solo pin e densa).
+ * cap_for_ram's projection is an ESTIMATE: on GB10 (#403) long generations
+ * overshot it by ~40 GB (projected 74.4, real 115.6 -> 3 kernel kills).
+ * Run D of the issue shows that a lower cap CONTAINS the growth:
+ * this guard does that automatically, on MEASURED RSS rather than projected.
+ * At the safe point (same place as repin: no MoE in flight), every ~16 emitted
+ * tokens: if RSS exceeds budget, evict the least-used LRU slots and lower
+ * ecap so they do not grow back. The slabs are >128KB (mmap'd by glibc): free
+ * returns the pages to the kernel immediately, so RSS really drops.
+ * The slot is NOT compacted away: it stays in place with eid=-1/used=0 (first
+ * reuse candidate), because with PILOT_REAL the worker holds pointers inside
+ * ecache[] during its preads and moving a slot would invalidate them; for the
+ * same reason eid<0 slots (reserved/in loading) are left alone and selection
+ * happens under g_pilot_mx. resident_bytes stays unchanged: LRU slots are never
+ * counted there (only pinned + dense bytes are).
  * EN: evict = free the slab in place (eid=-1, used=0, never compact: PILOT_REAL
  * EN: holds pointers into ecache[] across its preads), skip eid<0 reservations,
  * EN: select under g_pilot_mx. RSS_GUARD_GB=<gb> forces an explicit ceiling. */
-static double g_ram_budget_gb=0;              /* budget risolto, scritto da cap_for_ram */
+static double g_ram_budget_gb=0;              /* resolved budget, written by cap_for_ram */
 static uint64_t g_rssg_last=0;
 static void rss_guard(Model *m){
     double lim = getenv("RSS_GUARD_GB") ? atof(getenv("RSS_GUARD_GB")) : g_ram_budget_gb;
@@ -5264,14 +5298,14 @@ static void rss_guard(Model *m){
             if(!m->ecache || !m->ecache[l]) continue;
             pthread_mutex_lock(&g_pilot_mx);
             int nn=m->ecn[l], lru=-1;
-            for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
+            for(int z=0;z<nn;z++){                        /* only published slots with slabs */
                 ESlot *cand=&m->ecache[l][z];
                 if(cand->eid<0 || !cand->slab) continue;
                 if(lru<0 || cand->used<m->ecache[l][lru].used) lru=z;
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
             ESlot *s=&m->ecache[l][lru];
-            s->eid=-1;                                    /* nascosto: nessun hit/evict altrui */
+            s->eid=-1;                                    /* hidden: no external hit/evict */
             pthread_mutex_unlock(&g_pilot_mx);
             int64_t sb=s->slab_cap + s->fslab_cap*4;
 #ifdef COLI_METAL
@@ -5281,17 +5315,17 @@ static void rss_guard(Model *m){
             s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
             QT *q[3]={&s->g,&s->u,&s->d};
             for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
-            s->used=0;                                    /* primo candidato al riuso */
+            s->used=0;                                    /* first reuse candidate */
             freed += sb; dropped++;
         }
-        if(m->ecap>2) m->ecap--;                           /* il tetto scende: niente ricrescita */
+        if(m->ecap>2) m->ecap--;                           /* lower the cap: no regrowth */
     }
     if(dropped)
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
                        "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
 }
 static void repin_pass_limit(Model *m,int limit){
-    rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
+    rss_guard(m);                     /* #403: enforce the budget on MEASURED RSS */
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
@@ -5332,14 +5366,14 @@ static void repin_pass_limit(Model *m,int limit){
                 hq[k]->cuda_eligible=1; cq[k]->cuda_eligible=0;
                 if(!qt_cuda_update(hq[k])) ok=0;
             }
-            if(!ok){ fprintf(stderr,"[REPIN] refresh VRAM fallito\n"); exit(1); }
+            if(!ok){ fprintf(stderr,"[REPIN] VRAM refresh failed\n"); exit(1); }
             /* promoted expert now computes from VRAM: drop its host mlock
              * (mmap path; no-op otherwise) or every swap leaks locked pages */
             qt_unwire_mmap(&hot->g); qt_unwire_mmap(&hot->u); qt_unwire_mmap(&hot->d);
             if(g_cuda_release_host) expert_host_release(m,hot);
             gpu_swaps++;
             if(getenv("REPIN_VERBOSE")) fprintf(stderr,
-                "[REPIN] VRAM layer %d: esce/out %d (heat=%u) <- entra/in %d "
+                "[REPIN] VRAM layer %d: out %d (heat=%u) <- in %d "
                 "(heat=%u) in %.0f ms\n",cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
             continue;
         }
@@ -5370,17 +5404,17 @@ static void repin_pass_limit(Model *m,int limit){
         fprintf(stderr,"[REPIN] %s layer %d: evict %d (heat=%u) <- admit %d (heat=%u) in %.0f ms\n",
             tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
-    if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
+    if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d experts swapped in %.0f ms\n",
         gpu_swaps,(now_s()-pass_t0)*1e3);
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
 }
-/* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
- * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
- * costa ~182 KB/token. File <SNAP>/.coli_kv append-only: header (magic + dimensioni +
- * nrec) e un record per posizione [tok i32][Lc+Rc dei 78 layer][Ic DSA]. A fine turno
- * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
- * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
- * al resume kv_start=-1 e la finestra di draft riparte da sola. */
+/* ---- KV ON DISK: reopen the conversation HOT (KVSAVE=0 disables) ----
+ * Re-prefilling a reopened chat costs hours on this disk; compressed MLA KV costs
+ * ~182 KB/token. Append-only file <SNAP>/.coli_kv: header (magic + dimensions +
+ * nrec) and one record per position [tok i32][Lc+Rc of the 78 layers][Ic DSA]. At
+ * end of turn append ONLY the new positions and rewrite nrec last: a crash halfway
+ * through append leaves the old nrec = coherent file. The MTP layer's KV row is not saved:
+ * on resume kv_start=-1 and the draft window restarts by itself. */
 static int g_kvsave=1;
 #define KV_MAGIC "COLIKV1\0"
 static void kv_hdr(Model *m, int32_t *h, int nrec){
@@ -5419,7 +5453,7 @@ static int kv_disk_open(Model *m){
 static void kv_disk_truncate(Model *m, int nrec){
     if(!g_kvsave) return;
     KVState *k=m->kv;
-    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop to shrink on disc */
+    if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }  /* drop it so the file can shrink */
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
     k->disk_nrec=nrec;
@@ -5453,7 +5487,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         }
         fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
     }
-    fflush(f);                                   /* dati prima, contatore poi */
+    fflush(f);                                   /* data first, counter second */
     int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
     fflush(f);                                   /* persist the counter too */
     k->disk_nrec=len;
@@ -5485,7 +5519,7 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
 out:
     fclose(f);
     if(nrec>0){
-        if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
+        if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* the MTP window restarts on its own */
         fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
             nrec, now_s()-t0);
     }
@@ -5537,7 +5571,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
     hwinfo_emit(m);
-    usage_save(m);                       /* la cache che impara non deve aspettare l'uscita */
+    usage_save(m);                       /* the learning cache should not wait for exit */
     tiers_emit(m);
     emap_emit(m);
     hits_emit(m);
@@ -5654,15 +5688,15 @@ static void run_serve_mux(Model *m, const char *snap){
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
     setvbuf(stdin,NULL,_IONBF,0);
-    intr_install();                      /* Ctrl-C = chiudi i turni in volo, non il processo */
+    intr_install();                      /* Ctrl-C = end in-flight turns, not the process */
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
     emap_emit(m);
     int eof=0;
     for(;;){
-        if(g_intr){ g_intr=0;            /* stop morbido: ogni request attiva finisce ORA per la
-                                          * via normale di mux_done (DONE+stats+KV coerenti) */
+        if(g_intr){ g_intr=0;            /* soft stop: every active request ends NOW through
+                                          * the normal mux_done path (DONE+stats+KV coherent) */
             for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
         }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
@@ -5740,9 +5774,9 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
-    grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
+    grammar_setup(&T);                   /* method F: GRAMMAR=file.gbnf (#48) */
+    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NOT the official 1.0 — the tail of the
+                                          * int4 distribution is quantization noise */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
@@ -5759,17 +5793,17 @@ static void run_serve(Model *m, const char *snap){
     #define len   (sc->len)
     #define first (sc->first)
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
-    intr_install();                      /* Ctrl-C = fine turno, non fine processo */
+    intr_install();                      /* Ctrl-C = end of turn, not end of process */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
     while((nr=getline(&line,&cap,stdin))>0){
-        g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
+        g_intr=0;                        /* interrupts that arrived between turns: stale */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             kv_disk_reset(m);
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
-        if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
-            la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
+        if(!strcmp(line,"\x02MORE")){                /* continue the reply truncated by NGEN:
+            history is already in KV, so just re-forward the LAST token to recover logits */
             if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
             int cur=ngen; if(len+cur+g_draft+2>=maxctx) cur=maxctx-len-g_draft-2;
             uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
@@ -5785,7 +5819,7 @@ static void run_serve(Model *m, const char *snap){
             printf("STAT %d %.2f %.1f %.2f\n", prod, prod/tdt, (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb());
             fflush(stdout);
             if(g_prof) prof_report(m,&pb,tdt,prod,stderr);   /* per-turn window; stdout is the framed protocol */
-            kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: re-pin a caldo tra i turni / live re-pin between turns */
+            kv_disk_append(m,hist,len); repin_pass(m); continue; }   /* RFC: live re-pin between turns */
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         /* API mode: an exact, length-prefixed prompt. Unlike the interactive
          * line protocol this accepts newlines. The tokenized prompt is matched
@@ -5812,10 +5846,10 @@ static void run_serve(Model *m, const char *snap){
             if(req_ngen>ngen) req_ngen=ngen;
             g_temp=(float)rt; g_nuc=(float)rp;
         } else { active=0; sc=&ctx[0]; kv_bind(m,&sc->kv); }
-        int bl=0, k=0;                           /* costruisce/tokenizza il turno */
-        /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
-         * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
-         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
+        int bl=0, k=0;                           /* build/tokenize the turn */
+        /* OFFICIAL GLM-5.2 template (chat_template.jinja): no \n after roles, and after
+         * <|assistant|> the think block is ALWAYS required — <think></think> DISABLES it (nothink):
+         * with the wrong template the model babbles and never emits the stop token. THINK=1 enables it. */
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
@@ -5825,7 +5859,7 @@ static void run_serve(Model *m, const char *snap){
             if(prefix<old_len){
                 len=prefix;
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
-                kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
+                kv_disk_truncate(m,len);           /* the next append overwrites only the tail */
             }
             k=prompt_tokens-len;
             if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
@@ -5856,7 +5890,7 @@ static void run_serve(Model *m, const char *snap){
         ProfBase pb; if(g_prof) prof_base(m,&pb);
         float *logit;
         if(k>0){ albate_collect_arm(); logit=step(m,hist+len,k,len); len+=k; }
-        else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
+        else logit=step(m,hist+len-1,1,len-1);   /* identical/prefixed prompt: regenerate logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
         grammar_reset();                         /* nuova risposta = nuovo documento (MORE invece continua) */
@@ -5882,8 +5916,8 @@ static void run_serve(Model *m, const char *snap){
         fflush(stdout);
         if(g_prof) prof_report(m,&pb,tdt,prod,stderr);   /* per-turn window; stdout is the framed protocol */
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
-        usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
-        kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        usage_save(m);                   /* the learning cache: history updated every turn */
+        kv_disk_append(m,hist,len);      /* KV on disk: the next start resumes from here */
         repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
     }
     free(line); free(buf);
@@ -5902,13 +5936,13 @@ static int *read_arr(jval*o,const char*k,int*n){
     if(!r){ fprintf(stderr,"OOM read_arr\n"); exit(1); }
     for(int i=0;i<a->len;i++) r[i]=(int)a->kids[i]->num; *n=a->len; return r; }
 
-/* byte residenti di un tensore [O,I] al numero di bit dato (specchio di qt_bytes) */
+/* resident bytes of a tensor [O,I] at the given bit width (mirror of qt_bytes) */
 static int64_t tbytes(int O,int I,int bits){
     if(bits>=16) return (int64_t)O*I*4;
     if(bits>=5)  return (int64_t)O*I + (int64_t)O*4;
     return (int64_t)O*((I+1)/2) + (int64_t)O*4;
 }
-/* byte VERI di un expert: dal container se pre-quantizzato, altrimenti stima da ebits */
+/* TRUE bytes of one expert: from the container if pre-quantized, otherwise estimated from ebits */
 static int64_t expert_bytes_probe(Model *m, int ebits){
     Cfg *c=&m->c; int64_t eb=0; char nm[256];
     snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",c->first_dense);
@@ -5925,12 +5959,12 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
     return eb;
 }
 
-/* TIERS: fotografia della piramide expert per la dashboard web —
+/* TIERS: snapshot of the expert pyramid for the web dashboard —
  * "TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>" sul canale di protocollo.
- * ram = pinnati non-VRAM + LRU corrente; disk = tutto il resto. */
+ * ram = pinned non-VRAM + current LRU; disk = everything else. */
 /* BRAIN MAP (dashboard): per-turn expert hit bitmap + full residency/heat map.
- * g_ehit[layer][eid]=1 quando l'expert viene instradato in questo turno;
- * hits_emit lo serializza e lo azzera. emap_emit fotografa tier+heat di TUTTI. */
+ * g_ehit[layer][eid]=1 when the expert is routed in this turn;
+ * hits_emit serializes and clears it. emap_emit snapshots tier+heat for ALL experts. */
 static uint8_t **g_ehit;
 static void ehit_mark(Model *m, int layer, int eid){
     if(!g_ehit){ Cfg *c=&m->c;
@@ -5946,9 +5980,9 @@ static void ehit_mark(Model *m, int layer, int eid){
 static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double *ram_avail){
     cpu[0]=0;
 #ifdef _WIN32
-    /* niente /proc su Windows: brand string via CPUID (0x80000002..4), zero
-     * dipendenze extra. La dashboard mostrava "0 GB RAM / 0 cores" perche'
-     * tutto questo blocco era solo-Linux mentre il ramo CUDA funzionava. */
+    /* no /proc on Windows: brand string via CPUID (0x80000002..4), zero
+     * extra dependencies. The dashboard used to show "0 GB RAM / 0 cores"
+     * because this whole block was Linux-only while the CUDA branch worked. */
 #if defined(__x86_64__) || defined(__i386__)
     { unsigned int r[12]={0}; unsigned int *w=r;
       for(unsigned int f=0x80000002u; f<=0x80000004u; f++,w+=4)
@@ -5973,7 +6007,7 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
 #endif
     *ram_total=*ram_avail=0;
 #ifdef _WIN32
-    compat_meminfo(ram_total,ram_avail);   /* GlobalMemoryStatusEx, gia' in compat.h */
+    compat_meminfo(ram_total,ram_avail);   /* GlobalMemoryStatusEx, already wrapped in compat.h */
 #elif defined(__FreeBSD__)
     { unsigned long long phys=0; size_t n=sizeof(phys);
       if(sysctlbyname("hw.physmem",&phys,&n,NULL,0)==0 && phys){
@@ -6032,7 +6066,7 @@ static void tiers_emit(Model *m){
 }
 
 /* EMAP: 1 byte/expert (2bit tier: 0=disk 1=RAM 2=VRAM | 6bit heat log2-bucket),
- * righe = layer sparsi in ordine (+MTP se presente), colonne = n_experts. Hex. */
+ * rows = sparse layers in order (+MTP if present), columns = n_experts. Hex. */
 static void emap_emit(Model *m){
     Cfg *c=&m->c;
     int rows=0;
@@ -6066,7 +6100,7 @@ static void emap_emit(Model *m){
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex);
 }
 
-/* HITS: bitmap 1bit/expert (stesso ordine di EMAP), poi azzera per il turno dopo. */
+/* HITS: 1-bit-per-expert bitmap (same order as EMAP), then clear it for the next turn. */
 static void hits_emit(Model *m){
     Cfg *c=&m->c; if(!g_ehit) return;
     int rows=0;
@@ -6087,9 +6121,9 @@ static void hits_emit(Model *m){
     printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
 }
 
-/* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).
- * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
- * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
+/* Dump the expert-usage histogram to a file: lines "layer eid count" (for PIN).
+ * Includes the MTP row (layer n_layers). Atomic write (tmp+rename): called
+ * on every serve turn too, and the process may die at any time. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
@@ -6102,8 +6136,8 @@ static void stats_dump_q(Model *m, const char *path, int quiet){
 static void stats_dump(Model *m, const char *path){ stats_dump_q(m,path,0); }
 
 /* CACHE CHE IMPARA: istogramma d'uso PERSISTENTE in <SNAP>/.coli_usage.
- * Caricato all'avvio (i contatori ripartono dalla storia), salvato a ogni turno:
- * piu' usi colibri', meglio l'auto-pin conosce i TUOI expert caldi. */
+ * Loaded at startup (counters resume from history), saved every turn:
+ * the more you use Colibri, the better auto-pin learns YOUR hot experts. */
 static char g_usage_path[2100]="";
 static int64_t usage_load(Model *m, const char *path){
     FILE *f=fopen(path,"r"); if(!f) return 0;
@@ -6114,12 +6148,12 @@ static int64_t usage_load(Model *m, const char *path){
 }
 static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
 
-/* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
- * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
- * Ogni hit evita una lettura dal disco lento. */
-/* MLOCK: inchioda in RAM fisica gli expert pinnati cosi' il compressore di memoria di
- * macOS non li comprime/evacua (visto: RSS reale < residente previsto -> "hit" lenti).
- * -1 = auto (ON su macOS dove serve e RLIMIT_MEMLOCK e' permissivo; OFF altrove, dove
+/* HOT-STORE ("Colibri's Redis"): load into RAM, ONCE and for good, the top experts
+ * by measured usage frequency (STATS file from a previous run), within a GB budget.
+ * Every hit avoids one read from the slow disk. */
+/* MLOCK: wire pinned experts into physical RAM so macOS's memory compressor does not
+ * compress/evict them (observed: real RSS < intended resident set -> slow "hits").
+ * -1 = auto (ON on macOS where it matters and RLIMIT_MEMLOCK is permissive; OFF elsewhere, where
  * il limite e' spesso minuscolo e va alzato a mano), 0 = off, 1 = force.
  * EN: MLOCK: wire pinned experts into physical RAM so macOS's memory compressor can't
  * compress/evict them (we saw actual RSS < intended resident -> slow "hits"). -1 = auto
@@ -6131,11 +6165,10 @@ static int mem_should_wire(void){
 #if defined(__APPLE__)
     return 1;                                     /* macOS: default ON */
 #else
-    return 0;                                     /* Linux/altri: opt-in via MLOCK=1 / opt-in */
+    return 0;                                     /* Linux/others: opt-in via MLOCK=1 */
 #endif
 }
-/* Inchioda [addr,addr+len) in RAM fisica. No-op fuori da POSIX (Windows ecc.).
- * EN: wire [addr,addr+len) into physical RAM. No-op off POSIX (Windows, etc.). */
+/* Wire [addr,addr+len) into physical RAM. No-op off POSIX (Windows, etc.). */
 static int mem_wire(void *addr, size_t len){
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     return mlock(addr, len);
@@ -6145,8 +6178,7 @@ static int mem_wire(void *addr, size_t len){
     (void)addr; (void)len; return 0;
 #endif
 }
-/* Inchioda tutti gli slab degli expert pinnati (pesi + scale). Non fatale se fallisce.
- * EN: wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
+/* Wire all pinned-expert slabs (weights + scales). Non-fatal on failure. */
 /* mlock a single mmap'd QT's weight + scale ranges. Skips VRAM-tier QTs
  * (cuda_eligible): their compute runs from device memory, so wiring the host
  * mmap range would pin ~137 GB of never-touched file pages. NOTE the q8/q4
@@ -6217,7 +6249,7 @@ typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
-static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
+static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* definition below */
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
@@ -6243,15 +6275,15 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
     int64_t eb=expert_bytes_probe(m,m->ebits);
-    /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
-     * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
-     * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
-     * budget RAM, come AUTOPIN; il pin aggiorna resident_bytes, quindi cap_for_ram
-     * dopo restringe la LRU di conseguenza (nessun doppio conteggio). */
+    /* PIN_GB=all (#80): NOT literally "all". Pinning the whole set ignores the
+     * --ram budget and triggers a mid-generation kernel OOM kill (#229: 92 GB host
+     * killed with --ram 78, anon-rss 89 GB). Clamp to however many experts fit in
+     * the RAM budget, like AUTOPIN; pinning updates resident_bytes, so cap_for_ram
+     * later shrinks LRU accordingly (no double counting). */
     int npin;
     if(gb<0){
         double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
-        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* same default as the call site */
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
         npin=avail>0?(int)(avail/eb):0;
     } else npin=(int)(gb*1e9/eb);
@@ -6337,14 +6369,14 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(r); free(cnt_l); free(slot_of); free(next);
 }
 
-static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
-/* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
- * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). FreeBSD non espone un equivalente
- * stabile a MemAvailable e con ZFS la memoria davvero recuperabile puo' vivere
- * nell'ARC fuori dai contatori VM piu' ovvi; usare hw.physmem come fallback e'
- * molto meglio del vecchio "assumo 8 GB", che castrava la cache expert su host
- * con parecchia RAM. */
+static double g_mem_avail_boot=0;   /* MemAvailable at startup, before loading the model */
+/* RAM available RIGHT NOW (GB): this is the real ceiling, not total RAM. Linux: MemAvailable
+ * from /proc/meminfo. macOS: free+inactive+purgeable pages from host_statistics64
+ * (same semantics: reclaimable without swap). FreeBSD does not expose a stable
+ * MemAvailable equivalent, and with ZFS the truly reclaimable memory may live
+ * in ARC outside the most obvious VM counters; using hw.physmem as a fallback is
+ * much better than the old "assume 8 GB", which crippled the expert cache on
+ * hosts with plenty of RAM. */
 static double mem_available_gb(void){
 #ifdef __APPLE__
     mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
@@ -6381,7 +6413,7 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     return one*slots;
 }
 
-/* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
+/* bytes available for experts (pin + LRU) within the budget — mirror of cap_for_ram's accounting */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
@@ -6392,22 +6424,22 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
-/* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
- * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
- * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
+/* Clamp the expert cache to a RAM budget (GB): choose cap so resident + cache + slack <= budget.
+ * ram_gb<=0 -> AUTO budget = 88% of currently available RAM (leave headroom for OS+wrapper:
+ * overshooting means a mid-generation kernel OOM kill, much worse than a smaller cache). */
 static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    if(m->has_mtp) nsp+=2;                       /* riga cache MTP: conta ~doppia (expert int8 = 2x int4) */
+    if(m->has_mtp) nsp+=2;                       /* MTP cache row: counts roughly double (int8 expert = 2x int4) */
     int64_t eb=expert_bytes_probe(m,ebits);
     int auto_b = ram_gb<=0;
-    if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
-                                                   * allocato viene sottratto sotto, non due volte */
+    if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* measured BEFORE load: already-allocated resident bytes
+                                                   * are subtracted below, not counted twice */
         if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); ram_gb=8; } }
-    g_ram_budget_gb = ram_gb;                    /* #403: la RSS-guard usa il budget RISOLTO */
-    /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
-     *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
-     *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
-     *  attivazioni+logits+overhead ~1.2 GB */
+    g_ram_budget_gb = ram_gb;                    /* #403: RSS guard uses the RESOLVED budget */
+    /* HONEST slack, not a hand-wavy constant (the 2026-07-04 OOM came from here):
+     *  ws[64] working-set slabs (ALL materialized during prefill batch-union),
+     *  KV cache at max_ctx, kvb_all from k/v reconstruction in attention,
+     *  activations+logits+overhead ~1.2 GB */
     double ws_b  = 64.0*(double)eb;
     /* Under EXPERT_BUDGET, the block-of-64 working set is capped at budget experts
      * per layer — only ws[0..budget-1] are populated, not all 64. The 64×eb reserve
@@ -6417,9 +6449,9 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
-     * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
-     * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
+    /* PAGE-CACHE RESERVE (measured 2026-07-06 on Linux): starving it drops
+     * buffered preads from ~800 to ~180 MB/s — the last GBs of LRU buy LESS than
+     * they cost in lost disk bandwidth. 2.5 GB always stay with the kernel.
      * NOTE: tested removing this under Windows+DIRECT (it should be dead weight when
      * O_DIRECT bypasses the buffer cache). Result: cap went 4->5 but RSS hit 24 GB
      * on a 32 GB machine, causing memory pressure that DROPPED the hit rate (73%->57%)
@@ -6429,14 +6461,14 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
-    int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
+    int floored = capmax<1;   /* the budget cannot sustain even ONE slot per layer */
     if(capmax<1) capmax=1;
-    /* Il floor a 1 e' una bugia comoda: con avail negativo capmax sarebbe 0, cioe'
-     * "non ci sto nel tuo budget". Alzarlo a 1 e proseguire trasforma "non ci sto"
-     * in "sforo" -- ed e' esattamente l'OOM-kill a meta' generazione che questa
-     * funzione esiste per evitare. Il kernel uccide con SIGKILL: nessun errore,
-     * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
-     * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
+    /* Flooring to 1 is a convenient lie: with negative avail, capmax would be 0, meaning
+     * "this does not fit your budget". Raising it to 1 and continuing turns "does not fit"
+     * into "will overshoot" -- exactly the mid-generation OOM kill this function exists
+     * to prevent. The kernel kills with SIGKILL: no error, no log, the engine dies silently
+     * (issue #305). Say so, and stop if the projected peak does not even fit into the RAM
+     * actually measured as available at startup. */
     if(floored){
         double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
@@ -6518,7 +6550,7 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
     if(g_metal_enabled) backend="Metal";
 #endif
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
+    int rows=nsp+(m->has_mtp?2:0);               /* same convention as cap_for_ram (MTP int8 = 2x) */
     int pinned=0; for(int i=0;i<=c->n_layers;i++) if(m->npin) pinned+=m->npin[i];
     double eb=(double)expert_bytes_probe(m,m->ebits);
     fprintf(stderr,"[PROF] machine: %s | %d cores (%d omp threads) | RAM %.1f GB total, %.1f GB available | backend %s\n",
@@ -6596,21 +6628,21 @@ int main(int argc, char **argv){
     numa_init();                                       /* COLI_NUMA=1: expert-slab interleave (#82) */
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
-    /* EXPERT_BUDGET e' sotto quarantena: la finestra operativa e' misurata VUOTA.
-     * @bokiko su tre host (#303) e riprodotto qui su un 25 GB / WSL:
-     *   - hellaswag 30% a budget=8 contro 90% a budget spento (25% = il caso);
-     *   - a budget=4 il decode e' rumore ("The **1...: s2151:");
-     *   - accettazione MTP 0%: quali expert sopravvivono al cap dipende dalla
-     *     residenza in cache al momento del forward, quindi draft e verify NON
-     *     calcolano la stessa funzione -- la stessa invariante che #294 ha appena
-     *     stabilito, violata via stato di cache invece che via scelta del kernel;
-     *   - 0.13 tok/s contro 0.30 di baseline, con 14.66 expert caricati per layer
-     *     contro topk=8: il cap fa piu' I/O di quello che dice di risparmiare, e la
-     *     riga "~N GB I/O saved" conta esperti scartati, non byte non letti.
-     * Resta compilato e sviluppabile (EXPERT_BUDGET_EXPERIMENTAL=1) perche' l'idea
-     * -- MoE-Spec, arXiv 2602.16052 -- non e' sbagliata: e' l'implementazione che
-     * finora non ha un punto in cui sia insieme piu' veloce e corretta. Riaccenderlo
-     * di default richiede una misura di qualita' accanto a quella di velocita'. */
+    /* EXPERT_BUDGET is under quarantine: the measured operating window is EMPTY.
+     * @bokiko on three hosts (#303), reproduced here on a 25 GB / WSL box:
+     *   - hellaswag 30% at budget=8 versus 90% with the budget off (25% in the worst case);
+     *   - at budget=4 decode is noise ("The **1...: s2151:");
+     *   - MTP acceptance 0%: which experts survive the cap depends on cache residency
+     *     at forward time, so draft and verify do NOT compute the same function --
+     *     the same invariant #294 just established, violated through cache state
+     *     instead of kernel choice;
+     *   - 0.13 tok/s versus 0.30 baseline, while loading 14.66 experts/layer
+     *     against topk=8: the cap causes more I/O than it claims to save, and the
+     *     "~N GB I/O saved" line counts dropped experts, not unread bytes.
+     * It stays compiled and hackable (EXPERT_BUDGET_EXPERIMENTAL=1) because the idea
+     * -- MoE-Spec, arXiv 2602.16052 -- is not wrong: the implementation just does not
+     * yet have any point where it is both faster and correct. Re-enabling it by
+     * default requires a quality metric alongside the speed metric. */
     g_expert_budget = getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
     if(g_expert_budget>0 && !getenv("EXPERT_BUDGET_EXPERIMENTAL")){
         fprintf(stderr,"[EXPERT_BUDGET] ignored: measured empty operating window (issue #303).\n"
@@ -6642,7 +6674,7 @@ int main(int argc, char **argv){
     const char *policy=getenv("COLI_POLICY"); if(!policy) policy="quality";
     int experimental=!strcmp(policy,"experimental-fast");
     if(strcmp(policy,"quality")&&strcmp(policy,"balanced")&&!experimental){
-        fprintf(stderr,"COLI_POLICY non valida: quality, balanced o experimental-fast\n"); return 2;
+        fprintf(stderr,"invalid COLI_POLICY: use quality, balanced, or experimental-fast\n"); return 2;
     }
     if(!experimental&&(g_topk>0||g_topp>0)){
         fprintf(stderr,"[policy] --topp/--topk drop low-weight experts (~1.6x fewer reads, small quality cost)\n");
@@ -6650,11 +6682,11 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
-    g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */
-    g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */
-    g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = prefetch pilotato dal router */
-    g_pilot_real = getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):0; /* default OFF: load VERI cross-layer (value-preserving prefetch); PILOT_REAL=1 opta in */
-    if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
+    g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 with MTP, 0 without */
+    g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = measure routing predictability */
+    g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):0;    /* 1 = router-guided prefetch */
+    g_pilot_real = getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):0; /* default OFF: REAL cross-layer loads (value-preserving prefetch); PILOT_REAL=1 opts in */
+    if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implies PILOT active */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
@@ -6663,7 +6695,7 @@ int main(int argc, char **argv){
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
-    g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
+    g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split disk loads in stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32
         1                        /* default ON: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=0 opts out */
@@ -6695,23 +6727,27 @@ int main(int argc, char **argv){
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
+    g_no_i8_small_reuse = getenv("COLI_NO_I8_SMALL_REUSE")?atoi(getenv("COLI_NO_I8_SMALL_REUSE")):0;
     g_no_i8_small_pair = getenv("COLI_NO_I8_SMALL_PAIR")?atoi(getenv("COLI_NO_I8_SMALL_PAIR")):0;
     g_no_i8_small_gather = getenv("COLI_NO_I8_SMALL_GATHER")?atoi(getenv("COLI_NO_I8_SMALL_GATHER")):0;
+    g_no_i4_exact_sse = getenv("COLI_NO_I4_EXACT_SSE")?atoi(getenv("COLI_NO_I4_EXACT_SSE")):0;
+    g_no_rmsnorm_simd = getenv("COLI_NO_RMSNORM_SIMD")?atoi(getenv("COLI_NO_RMSNORM_SIMD")):0;
+    g_no_rope_inv_cache = getenv("COLI_NO_ROPE_INV_CACHE")?atoi(getenv("COLI_NO_ROPE_INV_CACHE")):0;
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
         else fprintf(stderr,"[ROUTE_TRACE] logging routing to %s\n",getenv("ROUTE_TRACE"));
     }
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
-    g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: live re-pin every n emitted tokens (0=off) */
+    g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: absorption for S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
-    /* matmul_qt documenta la soglia int4-IDOT come "configurabile con I4S" ma il getenv non
-     * c'era: la variabile non aveva alcun effetto. I4S=<n> -> IDOT int4 solo per S>=n.
+    /* matmul_qt documents the int4-IDOT threshold as "configurable via I4S", but the getenv
+     * was missing: the variable had no effect. I4S=<n> -> int4 IDOT only for S>=n.
      * EN: matmul_qt documents the int4 IDOT threshold as "configurable via I4S", but the
      * getenv was missing, so the knob did nothing. I4S=<n> -> int4 IDOT only for S>=n. */
     if(getenv("I4S")) g_i4s=atoi(getenv("I4S"));
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
-    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
+    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* tighter than the official 0.95: the int4 tail is noise */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft>63) g_draft=63;                             /* -1 = auto, risolto dopo model_init */
@@ -6734,10 +6770,6 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
-    g_no_i4_exact_sse = getenv("COLI_NO_I4_EXACT_SSE")?atoi(getenv("COLI_NO_I4_EXACT_SSE")):0;
-    g_no_i8_small_reuse = getenv("COLI_NO_I8_SMALL_REUSE")?atoi(getenv("COLI_NO_I8_SMALL_REUSE")):0;
-    g_no_rmsnorm_simd = getenv("COLI_NO_RMSNORM_SIMD")?atoi(getenv("COLI_NO_RMSNORM_SIMD")):0;
-    g_no_rope_inv_cache = getenv("COLI_NO_ROPE_INV_CACHE")?atoi(getenv("COLI_NO_ROPE_INV_CACHE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
@@ -6796,17 +6828,17 @@ int main(int argc, char **argv){
 #endif
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
-    /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
-     * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,
-     * altrimenti "MTP active (draft=8)" mentirebbe: il messaggio e' stampato
-     * prima della scelta del path (run_serve_mux, sotto), e con DRAFT=8 diceva
-     * "active" per poi disabilitarlo in silenzio (#358, LordMZTE). */
+    /* The MUX path (SERVE_BATCH=1, i.e. `coli serve`) forces g_draft=0 below —
+     * speculation is not ragged-safe in multi-slot batching. Report it HERE,
+     * otherwise "MTP active (draft=8)" would lie: the message is printed
+     * before the path choice (run_serve_mux, below), and with DRAFT=8 it used to say
+     * "active" only to disable it silently afterward (#358, LordMZTE). */
     int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
     int eff_draft = mux_will_disable_mtp ? 0 : g_draft;
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
            m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft);
-    /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
+    /* also on stderr: that is the channel the UIs (`coli`) show to the user */
     if(mux_will_disable_mtp && m.has_mtp)
         fprintf(stderr,"[MTP] disabled in multiplexed serve (SERVE_BATCH=1): speculation is not "
                        "ragged-safe across KV slots. Single-client interactive use (`coli chat`) keeps MTP.\n");
@@ -6822,15 +6854,16 @@ int main(int argc, char **argv){
                            "         Keep it on a native Linux fs (ext4/xfs/zfs) for memory efficiency and speed.\n", snap);
     }
 #endif
-    /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
-     * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
+    /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top experts by frequency fixed in RAM.
+     * This must happen BEFORE cap_for_ram: pinned experts count toward resident bytes. */
     if(getenv("PIN")){
         const char *pin=getenv("PIN"); char pauto[2100];
         if(!strcmp(pin,"auto")){
-            /* PIN=auto: la storia VIVA <SNAP>/.coli_usage (appesa a ogni turno) batte il
-             * profilo congelato stats.txt — il pin di ogni riavvio riflette il carico reale
-             * accumulato, non il prompt di bootstrap. Fallback stats.txt per una dir vergine;
-             * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
+            /* PIN=auto: the LIVE history <SNAP>/.coli_usage (appended every turn) beats the
+             * frozen stats.txt profile — each restart's pin placement reflects the real
+             * accumulated workload, not the bootstrap prompt. Fallback to stats.txt for a
+             * virgin directory; if neither exists -> no pinning (AUTOPIN below stays excluded:
+             * PIN is already set).
              * EN: prefer the live usage history over the frozen one-shot profile, so each
              * reload's pin placement follows the accumulated real workload. */
             snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
@@ -6854,41 +6887,41 @@ int main(int argc, char **argv){
         if(g_couple_d<1)g_couple_d=1; if(g_couple_d>2)g_couple_d=2;
         couple_load(&m, getenv("COUPLE"));
     }
-    /* CACHE CHE IMPARA: l'uso degli expert si accumula in <SNAP>/.coli_usage tra le sessioni;
-     * all'avvio i piu' usati vengono auto-pinnati in RAM (meta' del budget expert: il pin
-     * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
+    /* LEARNING CACHE: expert usage accumulates in <SNAP>/.coli_usage across sessions;
+     * at startup the most-used experts are auto-pinned in RAM (half the expert budget: pinning
+     * knows YOUR history, LRU adapts to the current session). AUTOPIN=0 disables it. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
-      int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
+      int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* same default as run_serve */
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
-          /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
-           * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
-           * qualche ora di chat) arriva a meta' del budget expert. */
+          /* Pin quota proportional to CONFIDENCE in the history: with little data pinning
+           * picks the wrong experts and steals slots from adaptive LRU; at steady state
+           * (>=200k selections, a few hours of chat) it grows to half the expert budget. */
           double conf = (double)hist/200000.0; if(conf>1) conf=1;
           double pin_gb = expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
       }
-      /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
-       * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
+      /* ALWAYS: without the clamp LRU grows to cap*76 layers = tens of GB -> OOM kill.
+       * RAM_GB absent or <=0 = automatic budget from MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx);
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
-    /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
+    /* scoring mode for benchmarks: SCORE=<requests.txt> -> log-likelihood per line */
     if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
 
-    /* modo serve persistente per la CLI 'coli': SERVE=1 */
+    /* persistent serve mode for the `coli` CLI: SERVE=1 */
     if(getenv("SERVE")){
         if(getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"))) run_serve_mux(&m,snap);
         else run_serve(&m,snap);
         if(stats) stats_dump(&m,stats); return 0;
     }
 
-    /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
+    /* real text mode: PROMPT="..." [NGEN=n] -> tokenize, generate, detokenize */
     const char *user_prompt = coli_user_prompt();   /* ignores cmd.exe's PROMPT template (#271) */
     if(user_prompt){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
@@ -6897,7 +6930,13 @@ int main(int argc, char **argv){
         return 0;
     }
 
-    /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
+    if(getenv("COLI_ALBATE_IDS")){
+        run_albate_ids(&m, getenv("COLI_ALBATE_IDS"));
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
+
+    /* otherwise: validate against the oracle (ref_glm.json) */
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
     FILE *f=fopen(refpath,"rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -6907,9 +6946,9 @@ int main(int argc, char **argv){
     int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
     int n_new=nfull-np;
-    /* L'oracolo (ref_glm.json in repo) e' del modello TINY: contro il 744B da' 0/20
-     * garantito su OGNI piattaforma (prompt-token tiny = spazzatura per il modello vero).
-     * Non e' un bug del motore — vedi #76. */
+    /* The oracle (ref_glm.json in the repo) is for the TINY model: against the 744B it yields
+     * a guaranteed 0/20 on EVERY platform (tiny prompt tokens are garbage for the real model).
+     * This is not an engine bug — see #76. */
     { int maxid=0; for(int i=0;i<nfull;i++) if(full[i]>maxid) maxid=full[i];
       if(m.c.vocab>1000 && maxid<1000 && !getenv("REF_FORCE")){
         fprintf(stderr,
@@ -6920,8 +6959,8 @@ int main(int argc, char **argv){
           "         or:                python coli chat --model <model>\n"
           "         REF_FORCE=1 to run the comparison anyway (meaningless).\n"
           "  --- IT ---\n"
-          "  Nessun PROMPT: modo auto-validazione, ma ref_glm.json e' l'oracolo del modello TINY\n"
-          "  (token max %d, il tuo vocab e' %d). Usa PROMPT=... per generare davvero (vedi sopra).\n",
+          "  No PROMPT: auto-validation mode, but ref_glm.json is the TINY model's oracle\n"
+          "  (max token %d, your vocab is %d). Use PROMPT=... for real generation (see above).\n",
           maxid, m.c.vocab, maxid, m.c.vocab);
         return 1;
       } }

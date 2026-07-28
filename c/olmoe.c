@@ -1,10 +1,10 @@
-/* Motore di inferenza OLMoE in C puro, con EXPERT-STREAMING dal disco.
- * Porting del motore Python (engine.py). Obiettivo Stadio A: produrre gli STESSI
- * token id del riferimento (ref.json) -> valida il core prima di scalare a GLM-5.2.
+/* Pure-C OLMoE inference engine, with EXPERT-STREAMING from disk.
+ * Port of the Python engine (engine.py). Stage A goal: produce the SAME
+ * token ids as the reference (ref.json) -> validate the core before scaling to GLM-5.2.
  *
- * Densa (embed, attn, router, norme, lm_head) residente in RAM (float32).
- * Expert letti dal disco on-demand via pread+fadvise(DONTNEED), cache LRU per-layer.
- * Matmul multi-thread con OpenMP (niente BLAS).
+ * Dense weights (embed, attention, router, norms, lm_head) stay resident in RAM (float32).
+ * Experts are read from disk on demand via pread+fadvise(DONTNEED), with a per-layer LRU cache.
+ * Multi-threaded matmul with OpenMP (no BLAS).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -24,27 +24,27 @@ typedef struct {
     float theta, eps; int norm_topk;
 } Cfg;
 
-/* ---------- pesi densi per-layer ---------- */
+/* ---------- dense per-layer weights ---------- */
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
 } Layer;
 
-/* ---------- cache LRU degli expert (pesi QUANTIZZATI) ----------
- * Ogni weight [out,in] tenuto come int8 (per-riga) + scala float per riga.
- * Cosi' la RAM-cache scende da 4 byte/param (f32) a 1 byte/param: e' il
- * meccanismo che fa stare GLM-5.2 nei 15 GB. dequant-on-use nel matmul. */
+/* ---------- expert LRU cache (QUANTIZED weights) ----------
+ * Each [out,in] weight is stored as int8 (per-row) + one float scale per row.
+ * That shrinks the RAM cache from 4 bytes/param (f32) to 1 byte/param: it is
+ * the mechanism that lets GLM-5.2 fit in 15 GB. Dequant-on-use in matmul. */
 typedef struct { int eid; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
 typedef struct {
     Cfg c;
     shards S;
-    int quant_bits;        /* bit di quantizzazione degli expert (2..8); storage int8, niente f32 (#134) */
+    int quant_bits;        /* expert quantization bits (2..8); int8 storage, no f32 (#134) */
     float *embed, *lm_head, *final_norm;
     Layer *L;
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
-    /* kv-cache per-layer: K,V come [H * maxT * head_dim] */
+    /* per-layer kv-cache: K,V as [H * maxT * head_dim] */
     float **K, **V; int kv_len, max_t;
     double dense_load_s;
 } Model;
@@ -72,11 +72,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
     }
 }
 
-/* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
+/* y[1,O] = x[1,I] @ W^T with quantized W: q[O,I] int8 + one scale per row.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
- * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
- * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
- * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
+ * On ARM: Q8_0-quantized activations (one scale per 16-value block) + NEON
+ * int8 dot product (`sdot` where dotprod exists) — same IDOT family as `glm.c`,
+ * with IDOT=0 selecting the byte-exact scalar path. Measured 2.7x end-to-end on M5. */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
@@ -123,8 +123,8 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     }
 }
 
-/* quantizza un weight f32 [O,I] -> int8 q[O,I] + scala[O], simmetrica per riga.
- * Replica quant_dequant() del Python: scale = amax(|w|, riga)/qmax, q = round(w/scale). */
+/* Quantize an f32 [O,I] weight into int8 q[O,I] + scale[O], symmetric per row.
+ * Matches Python `quant_dequant()`: scale = amax(|w|, row)/qmax, q = round(w/scale). */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
     int qmax = (1 << (bits - 1)) - 1;     /* 8->127, 4->7, 2->1 */
     #pragma omp parallel for schedule(static)
@@ -143,7 +143,7 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
     }
 }
 
-/* rmsnorm su una riga di lunghezza D, in-place su out (out puo' essere == x) */
+/* RMSNorm on one row of length D, in-place into out (out may equal x). */
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
     float r = 1.f / sqrtf((float)(ms / D) + eps);
@@ -156,7 +156,7 @@ static void softmax_row(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= s;
 }
 
-/* ---------- caricamento ---------- */
+/* ---------- loading ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
@@ -182,7 +182,7 @@ static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
+    st_read_f32(&m->S, name, p, 0);   /* dense: no DONTNEED, stays resident */
     return p;
 }
 
@@ -214,13 +214,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->dense_load_s = now_s() - t0;
 }
 
-/* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O].
- * Container pre-quantizzato (convert_olmoe.py: int8 + scale f32 in "name.qs"):
- * lettura raw diretta — meta' I/O e zero quantize_rows a runtime. Prima di
- * questa patch il container int8 causava SIGBUS (st_read_f32 su tensori I8). */
+/* Read a weight from disk (streaming) and quantize it into q[O,I]+scale[O].
+ * Pre-quantized container (`convert_olmoe.py`: int8 + f32 scale in "name.qs"):
+ * direct raw read — half the I/O and zero `quantize_rows` at runtime. Before
+ * this patch the int8 container caused SIGBUS (`st_read_f32` on I8 tensors). */
 static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
     st_tensor *t = st_find(&m->S, name);
-    if (t && t->dtype == 3) {                    /* I8/U8: container colibri */
+    if (t && t->dtype == 3) {                    /* I8/U8: colibri container */
         char qs[300]; snprintf(qs, sizeof(qs), "%s.qs", name);
         st_read_raw(&m->S, name, q, 1);
         st_read_f32(&m->S, qs, scale, 1);
@@ -230,7 +230,7 @@ static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, i
     quantize_rows(tmp, q, scale, O, I, m->quant_bits);
 }
 
-/* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
+/* ---------- expert cache: return quantized weights (q+scale) from cache or disk ---------- */
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
@@ -267,7 +267,7 @@ static void rope_head(float *x, int pos, const Cfg *c) {
     }
 }
 
-/* attenzione sui token nuovi x[S,hidden]; pos_base = posizione assoluta del primo token nuovo */
+/* Attention over new tokens x[S,hidden]; `pos_base` = absolute position of the first new token. */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
@@ -281,7 +281,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
-    /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
+    /* Write k,v into the kv-cache at positions pos_base..pos_base+S-1. */
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
         int t = pos_base + s;
         memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + (int64_t)s*D + hh*hd, hd*sizeof(float));
@@ -352,7 +352,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(logits); free(g); free(u); free(hh);
 }
 
-/* un passo: token nuovi ids[S] a posizione pos_base. Ritorna logits dell'ultimo token (malloc'd). */
+/* One step: new tokens ids[S] at position pos_base. Returns logits of the last token (malloc'd). */
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
@@ -368,7 +368,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos_base + S;
-    /* solo l'ultimo token -> logits */
+    /* Only the last token -> logits */
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -431,7 +431,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     return scored;
 }
 
-/* ---------- lettura ref.json ---------- */
+/* ---------- read ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
     int *r = malloc(a->len * sizeof(int));
